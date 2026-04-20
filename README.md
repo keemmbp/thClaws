@@ -54,7 +54,7 @@ thClaws is a **native-Rust AI agent workspace** that runs locally on your machin
 
 ### Pre-built binaries
 
-Download the latest release for your platform from the [Releases page](https://github.com/thClaws/thClaws/releases) or from [agentic-press.com/thclaws/downloads](https://agentic-press.com/thclaws/downloads).
+Download the latest release for your platform from the [Releases page](https://github.com/thClaws/thClaws/releases) or from [thclaws.ai/downloads](https://thclaws.ai/downloads).
 
 Supported: macOS (Apple Silicon & Intel), Windows (x86_64 & ARM64), Linux (x86_64 & ARM64).
 
@@ -131,7 +131,8 @@ API keys are **never stored in config files** — only in the OS keychain (defau
 
 ## Documentation
 
-- **Full user manual** — [thclaws.com/manual](https://thclaws.com/manual) *(soon)* or the [`user-manual/`](https://github.com/thClaws/user-manual) companion repo. 24 chapters covering every feature plus 7 walkthrough case studies (static site deploy, Node.js reservation site, news-aggregation agent, etc.).
+- **Official site** — [thclaws.ai](https://thclaws.ai)
+- **Full user manual** — [thclaws.ai/manual](https://thclaws.ai/manual) *(soon)* or the [`user-manual/`](https://github.com/thClaws/user-manual) companion repo. 24 chapters covering every feature plus 7 walkthrough case studies (static site deploy, Node.js reservation site, news-aggregation agent, etc.).
 - [Contributing](CONTRIBUTING.md) — dev setup, PR flow, commit style
 - [Changelog](CHANGELOG.md) — version history
 - [Code of Conduct](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1
