@@ -1,8 +1,8 @@
 # thClaws 🦞
 
-> **Open-source Agent Harness Platform** — Native AI coding agent + workspace + multi-agent coordination. Runs on your own machine. Sovereign by design.
+> **Open-source Agent Harness Platform** — Native AI agent workspace. Code, automate, remember, coordinate. Runs on your own machine. Sovereign by design.
 
-thClaws is a native Rust agent that turns your machine into a full AI workspace: chat, code assistant, multi-agent team, terminal, file editor, media viewer, and a built-in knowledge base. It speaks every major LLM (Anthropic, OpenAI, Google, DashScope, Ollama, and Agentic Press) and reads Claude Code's configuration files unchanged — so you can migrate without rewriting anything.
+thClaws is a native Rust **AI agent workspace** — not just a coding assistant. One binary gives you: chat, coding agent, multi-agent team coordination, terminal, file editor, media viewer, and a built-in knowledge base. It speaks every major LLM (Anthropic, OpenAI, Google, DashScope, Ollama, and Agentic Press) and reads Claude Code's configuration files unchanged — so you can migrate without rewriting anything.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Platform: macOS · Windows · Linux](https://img.shields.io/badge/platform-macOS%20·%20Windows%20·%20Linux-lightgrey.svg)](#installation)

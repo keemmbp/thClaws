@@ -18,7 +18,7 @@ use thclaws_core::{endpoints, secrets};
         "built:    ", env!("THCLAWS_BUILD_TIME"),
             " (", env!("THCLAWS_BUILD_PROFILE"), ")"
     ),
-    about = "thClaws AI coding agent (CLI only)"
+    about = "thClaws AI agent workspace (CLI only)"
 )]
 struct Cli {
     /// Non-interactive: run prompt and exit

@@ -2,7 +2,7 @@
 name = "thclaws-core"
 version = "0.2.1"
 edition = "2021"
-description = "thClaws — native Rust AI coding agent with CLI and desktop GUI."
+description = "thClaws — native Rust AI agent workspace with CLI and desktop GUI."
 license = "MIT OR Apache-2.0"
 
 [dependencies]

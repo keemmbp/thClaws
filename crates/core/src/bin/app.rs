@@ -22,7 +22,7 @@ use thclaws_core::{endpoints, secrets};
         "built:    ", env!("THCLAWS_BUILD_TIME"),
             " (", env!("THCLAWS_BUILD_PROFILE"), ")"
     ),
-    about = "thClaws AI coding agent (GUI + CLI)"
+    about = "thClaws AI agent workspace (GUI + CLI)"
 )]
 struct Cli {
     /// Run in CLI mode (interactive REPL) instead of GUI

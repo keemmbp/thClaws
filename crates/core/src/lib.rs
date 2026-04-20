@@ -1,4 +1,4 @@
-//! thclaws-core: native Rust AI coding agent library.
+//! thclaws-core: native Rust AI agent workspace library.
 //!
 //! Module layout follows the phased port plan in `dev-log/007-native-port-plan.md`.
 //! Phase 5 lands the foundations: errors, types, config, token estimation.
