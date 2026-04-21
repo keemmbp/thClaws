@@ -33,10 +33,14 @@ arboard = "3"
 portable-pty = { version = "0.9", optional = true }
 tao = { version = "0.34", optional = true }
 wry = { version = "0.54", optional = true }
+# Markdown → HTML for the Files-tab preview. GFM tables, strikethrough,
+# task lists, autolinks. `unsafe_ = false` strips raw HTML (incl. scripts)
+# before we hand it to the sandboxed iframe.
+comrak = { version = "0.29", default-features = false, optional = true }
 
 [features]
 default = []
-gui = ["dep:tao", "dep:wry", "dep:portable-pty"]
+gui = ["dep:tao", "dep:wry", "dep:portable-pty", "dep:comrak"]
 
 [[bin]]
 name = "thclaws-cli"

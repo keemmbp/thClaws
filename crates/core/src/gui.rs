@@ -143,6 +143,88 @@ impl PtyBridge {
 
 const MAX_RECENT_DIRS: usize = 3;
 
+/// Convert a markdown string to a full standalone HTML document so the
+/// Files-tab iframe can render it without any client-side markdown
+/// library. GFM extensions are enabled (tables, task lists,
+/// strikethrough, autolinks); raw HTML in the source is stripped
+/// (`render.unsafe_ = false`) so `<script>` in a `.md` file we're
+/// previewing can't escape the iframe sandbox.
+fn render_markdown_to_html(md: &str) -> String {
+    let mut opts = comrak::ComrakOptions::default();
+    opts.extension.table = true;
+    opts.extension.strikethrough = true;
+    opts.extension.tasklist = true;
+    opts.extension.autolink = true;
+    opts.extension.footnotes = true;
+    opts.extension.header_ids = Some(String::new());
+    opts.render.unsafe_ = false;
+    let body = comrak::markdown_to_html(md, &opts);
+
+    // Minimal themed shell. Colors follow the dark preview theme the
+    // rest of the webview uses, with a light-mode fallback via the
+    // `prefers-color-scheme` media query.
+    format!(
+        r##"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {{
+    color-scheme: light dark;
+    --fg: #e6e6e6;
+    --bg: #1a1a1a;
+    --muted: #9aa0a6;
+    --accent: #6cb0ff;
+    --code-bg: #2a2a2a;
+    --border: #333;
+  }}
+  @media (prefers-color-scheme: light) {{
+    :root {{
+      --fg: #1a1a1a;
+      --bg: #ffffff;
+      --muted: #606366;
+      --accent: #2867c4;
+      --code-bg: #f3f4f6;
+      --border: #d0d7de;
+    }}
+  }}
+  html, body {{ margin: 0; padding: 0; }}
+  body {{
+    font: 14px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "Helvetica Neue", Arial, "Noto Sans Thai", sans-serif;
+    color: var(--fg); background: var(--bg); padding: 24px 32px;
+    max-width: 880px; margin: 0 auto;
+  }}
+  h1, h2, h3, h4, h5, h6 {{ line-height: 1.25; margin: 1.4em 0 0.5em; }}
+  h1 {{ font-size: 1.8em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }}
+  h2 {{ font-size: 1.4em; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }}
+  h3 {{ font-size: 1.2em; }}
+  p, ul, ol, blockquote, pre, table {{ margin: 0.8em 0; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 0.92em; background: var(--code-bg);
+          padding: 2px 5px; border-radius: 3px; }}
+  pre {{ background: var(--code-bg); padding: 12px 14px; border-radius: 6px;
+         overflow-x: auto; }}
+  pre code {{ background: transparent; padding: 0; font-size: 0.9em; }}
+  blockquote {{ margin: 0.8em 0; padding: 0 1em; color: var(--muted);
+                border-left: 3px solid var(--border); }}
+  table {{ border-collapse: collapse; }}
+  th, td {{ border: 1px solid var(--border); padding: 6px 12px; text-align: left; }}
+  th {{ background: var(--code-bg); font-weight: 600; }}
+  hr {{ border: 0; border-top: 1px solid var(--border); margin: 2em 0; }}
+  img {{ max-width: 100%; height: auto; }}
+  ul.contains-task-list {{ list-style: none; padding-left: 1em; }}
+  .task-list-item input[type="checkbox"] {{ margin-right: 0.5em; }}
+</style>
+</head><body>
+{body}
+</body></html>"##,
+        body = body
+    )
+}
+
 fn recent_dirs_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(std::path::PathBuf::from(home).join(".config/thclaws/recent_dirs.json"))
@@ -1323,6 +1405,7 @@ pub fn run_gui() {
                                 .to_lowercase();
                             let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp");
                             let is_pdf = ext == "pdf";
+                            let is_markdown = ext == "md" || ext == "markdown";
                             let mime = match ext.as_str() {
                                 "png" => "image/png",
                                 "jpg" | "jpeg" => "image/jpeg",
@@ -1332,7 +1415,12 @@ pub fn run_gui() {
                                 "ico" => "image/x-icon",
                                 "bmp" => "image/bmp",
                                 "pdf" => "application/pdf",
-                                "md" => "text/markdown",
+                                // Markdown is rendered server-side to HTML
+                                // so the webview gets a ready-to-display
+                                // document (with tables, code highlighting,
+                                // GFM extensions) instead of raw `.md` that
+                                // the frontend would have to parse.
+                                "md" | "markdown" => "text/html",
                                 "html" | "htm" => "text/html",
                                 _ => "text/plain",
                             };
@@ -1350,10 +1438,15 @@ pub fn run_gui() {
                             } else {
                                 match std::fs::read_to_string(&path) {
                                     Ok(text) => {
+                                        let content = if is_markdown {
+                                            render_markdown_to_html(&text)
+                                        } else {
+                                            text
+                                        };
                                         let payload = serde_json::json!({
                                             "type": "file_content",
                                             "path": raw_path,
-                                            "content": text,
+                                            "content": content,
                                             "mime": mime,
                                         });
                                         let _ = proxy_for_ipc.send_event(UserEvent::FileContent(payload.to_string()));

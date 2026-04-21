@@ -1,8 +1,11 @@
 import { useState, useEffect } from "react";
 import { Folder, File, ArrowUp } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { send, subscribe } from "../hooks/useIPC";
+
+// NOTE: .md files are rendered to HTML server-side (via comrak, with
+// GFM tables) and returned with mime `text/html`, so we no longer
+// import react-markdown / remark-gfm here — the iframe branch below
+// handles both raw `.html` files and rendered-markdown uniformly.
 
 type FileEntry = {
   name: string;
@@ -74,7 +77,6 @@ export function FilesView({ active }: Props) {
     send({ type: "file_read", path });
   };
 
-  const isMarkdown = preview?.mime === "text/markdown";
   const isHtml = preview?.mime === "text/html";
   const isImage = preview?.mime.startsWith("image/");
   const isPdf = preview?.mime === "application/pdf";
@@ -167,15 +169,6 @@ export function FilesView({ active }: Props) {
                 style={{ borderColor: "var(--border)", background: "#fff" }}
                 title={preview.path}
               />
-            ) : isMarkdown ? (
-              <div
-                className="prose prose-invert prose-sm max-w-none flex-1 min-h-0 overflow-auto"
-                style={{ color: "var(--text-primary)" }}
-              >
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {preview.content}
-                </ReactMarkdown>
-              </div>
             ) : isHtml ? (
               <iframe
                 srcDoc={preview.content}
