@@ -279,6 +279,18 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         },
         "save" => SlashCommand::Save,
         "load" => SlashCommand::Load(args.to_string()),
+        // `/resume` is a load-latest alias so the user-facing behaviour
+        // mirrors the `--resume [ID|NAME]` CLI flag. Bare `/resume`
+        // pulls the newest session; `/resume NAME` is the same as
+        // `/load NAME`.
+        "resume" => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("last") {
+                SlashCommand::Load("last".into())
+            } else {
+                SlashCommand::Load(trimmed.to_string())
+            }
+        }
         "sessions" => SlashCommand::Sessions,
         "rename" => SlashCommand::Rename(args.to_string()),
         "mcp" => parse_mcp_subcommand(args),
@@ -419,6 +431,7 @@ pub fn render_help() -> &'static str {
      /config key=val   Set a config value (session-only for now)\n  \
      /save             Force-save the current session\n  \
      /load ID|NAME     Load a saved session by id or (renamed) title\n  \
+     /resume [ID|NAME] Resume the latest session (or a specific one by id/name)\n  \
      /sessions         List saved sessions\n  \
      /rename [NAME]    Rename the current session (no arg clears the title)\n  \
      /memory           List memory entries\n  \
@@ -1954,28 +1967,44 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 SlashCommand::Load(name_or_id) => {
                     let name_or_id = name_or_id.trim();
                     if name_or_id.is_empty() {
-                        println!("{COLOR_YELLOW}usage: /load SESSION_ID | NAME{COLOR_RESET}");
+                        println!("{COLOR_YELLOW}usage: /load SESSION_ID | NAME (or /resume for the latest){COLOR_RESET}");
                         continue;
                     }
                     match &session_store {
-                        Some(store) => match store.load_by_name_or_id(name_or_id) {
-                            Ok(loaded) => {
-                                agent.set_history(loaded.messages.clone());
-                                session = loaded;
-                                let label = session
-                                    .title
-                                    .as_deref()
-                                    .map(|t| format!("{t} ({})", session.id))
-                                    .unwrap_or_else(|| session.id.clone());
-                                println!(
-                                    "{COLOR_DIM}loaded {label} ({} message(s)){COLOR_RESET}",
-                                    session.messages.len()
-                                );
+                        Some(store) => {
+                            // `/resume` is wired as `/load last`; resolve
+                            // that to the newest session instead of
+                            // treating "last" as a literal session id.
+                            let loaded_result = if name_or_id.eq_ignore_ascii_case("last") {
+                                match store.latest() {
+                                    Ok(Some(s)) => Ok(s),
+                                    Ok(None) => Err(crate::error::Error::Config(
+                                        "no saved sessions to resume".into(),
+                                    )),
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                store.load_by_name_or_id(name_or_id)
+                            };
+                            match loaded_result {
+                                Ok(loaded) => {
+                                    agent.set_history(loaded.messages.clone());
+                                    session = loaded;
+                                    let label = session
+                                        .title
+                                        .as_deref()
+                                        .map(|t| format!("{t} ({})", session.id))
+                                        .unwrap_or_else(|| session.id.clone());
+                                    println!(
+                                        "{COLOR_DIM}loaded {label} ({} message(s)){COLOR_RESET}",
+                                        session.messages.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    println!("{COLOR_YELLOW}load failed: {e}{COLOR_RESET}");
+                                }
                             }
-                            Err(e) => {
-                                println!("{COLOR_YELLOW}load failed: {e}{COLOR_RESET}");
-                            }
-                        },
+                        }
                         None => println!(
                             "{COLOR_YELLOW}no session store (set $HOME){COLOR_RESET}"
                         ),
@@ -3079,11 +3108,39 @@ mod tests {
             "/history",
             "/save",
             "/load",
+            "/resume",
             "/sessions",
             "/rename",
         ] {
             assert!(h.contains(needle), "missing {needle} in help");
         }
+    }
+
+    #[test]
+    fn parse_slash_resume_aliases_to_load() {
+        // Bare /resume → Load("last")
+        assert_eq!(
+            parse_slash("/resume"),
+            Some(SlashCommand::Load("last".into()))
+        );
+        // /resume last (case-insensitive) → Load("last")
+        assert_eq!(
+            parse_slash("/resume last"),
+            Some(SlashCommand::Load("last".into()))
+        );
+        assert_eq!(
+            parse_slash("/resume LAST"),
+            Some(SlashCommand::Load("last".into()))
+        );
+        // /resume <name> → Load(name) (same handler path as /load)
+        assert_eq!(
+            parse_slash("/resume sess-abc123"),
+            Some(SlashCommand::Load("sess-abc123".into()))
+        );
+        assert_eq!(
+            parse_slash("/resume my-refactor"),
+            Some(SlashCommand::Load("my-refactor".into()))
+        );
     }
 
     #[test]
