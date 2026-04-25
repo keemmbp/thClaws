@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-04-25
+
+Patch release fixing two GUI startup-recovery bugs surfaced in the
+hours after v0.3.1 shipped. Both reach the user before they've typed
+their first prompt, so this release is recommended for everyone on
+v0.3.1 — particularly Linux users, who can't launch v0.3.1 at all.
+
+### Fixed
+
+- **Linux GUI startup panic.** v0.3.1 panicked at startup on every
+  Linux build with `webview build: UnsupportedWindowHandle`
+  (reported on Ubuntu 22.04). `wry` can't construct a WebKit2GTK
+  webview from a raw window handle the way it does on macOS / Windows
+  — WebKit2GTK is a GTK widget that has to be packed into a GTK
+  container. Fixed by switching to `wry`'s Linux-only
+  `build_gtk(window.default_vbox().unwrap())` behind
+  `#[cfg(target_os = "linux")]`. The cross-platform path is preserved
+  for macOS / Windows. (commits 6171815 by @Phruetthiphong + 729538b)
+- **First-time API key setup required an app restart.** Pasting a
+  provider key in Settings on a fresh install would update the sidebar
+  to show the new provider, but the running agent kept holding the
+  stale (or no-op) provider it was constructed with at startup —
+  resulting in "sidebar shows openai but error mentions anthropic"
+  on the first send. Two fixes:
+  - The shared-session worker no longer exits on missing-key startup;
+    it installs a `NoopProvider` placeholder and stays alive so a
+    later config reload can swap in a real provider.
+  - Added `ShellInput::ReloadConfig`. The `api_key_set` and
+    `api_key_clear` IPC handlers now send it after their save, so the
+    worker reloads `AppConfig`, rebuilds the agent's provider in
+    place, and broadcasts the sidebar update — all without an app
+    restart. (commit 27d163d)
+
 ## [0.3.1] — 2026-04-25
 
 Re-release of v0.3.0 — the v0.3.0 tag's release workflow failed
