@@ -1602,6 +1602,12 @@ pub fn run_gui() {
                                 broadcast.to_string()
                             ));
                         }
+                        // Tell the running worker to reload its config
+                        // and rebuild its provider. Without this, the
+                        // sidebar reflects the new key but the agent
+                        // keeps streaming through the stale (or noop)
+                        // provider it was constructed with at startup.
+                        let _ = shared_for_ipc.input_tx.send(ShellInput::ReloadConfig);
                     }
                 }
                 "api_key_clear" => {
@@ -1630,6 +1636,12 @@ pub fn run_gui() {
                     let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(
                         payload.to_string()
                     ));
+                    // Mirror api_key_set: tell the worker to re-pick a
+                    // provider. If the cleared key was the active one,
+                    // the rebuild will land on a fallback (or the
+                    // NoopProvider) consistent with what the sidebar
+                    // shows after readiness flips.
+                    let _ = shared_for_ipc.input_tx.send(ShellInput::ReloadConfig);
                 }
                 "team_send_message" => {
                     // Send a message from the user to a teammate's inbox.

@@ -13,11 +13,14 @@
 use crate::agent::{Agent, AgentEvent};
 use crate::config::AppConfig;
 use crate::context::ProjectContext;
+use crate::error::{Error, Result as CoreResult};
 use crate::memory::MemoryStore;
-use crate::repl::build_provider;
+use crate::providers::{EventStream, Provider, StreamRequest};
+use crate::repl::{build_provider, build_provider_with_fallback};
 use crate::session::{Session, SessionStore};
 use crate::tools::ToolRegistry;
 use crate::types::{ContentBlock, Message, Role};
+use async_trait::async_trait;
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +106,14 @@ pub enum ShellInput {
     /// etc.). Surface as a `ViewEvent::ErrorText` so the user sees
     /// *why* a configured MCP server never came online.
     McpFailed { server_name: String, error: String },
+    /// Reload `AppConfig` from disk and rebuild the agent's provider in
+    /// place. Sent by the GUI after `api_key_set` / `api_key_clear` so
+    /// the running session picks up the new key (and any auto-fallback
+    /// model swap that just happened) without needing an app restart.
+    /// Without this, the sidebar reflects the new provider while the
+    /// worker keeps holding the stale one — the exact mismatch users
+    /// see as "sidebar says openai but error mentions anthropic."
+    ReloadConfig,
 }
 
 /// What both tabs render. Each variant maps to a UI affordance:
@@ -548,13 +559,24 @@ async fn run_worker(
 
     let system = build_system_prompt(&config, &cwd, &skill_store);
 
-    let provider = match build_provider(&config) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = events_tx.send(ViewEvent::ErrorText(format!("Provider error: {e}")));
-            return;
-        }
-    };
+    // `build_provider_with_fallback` walks the configured model first,
+    // then any provider whose key is actually present, before giving
+    // up. If everything fails we install a `NoopProvider` that errors
+    // on stream() with a clear "configure a key" message — this keeps
+    // the worker loop alive so the user can recover via Settings →
+    // API key (which sends `ReloadConfig` and rebuilds the agent in
+    // place). The previous `return` here killed the chat for the rest
+    // of the session.
+    let mut config = config;
+    let (maybe_provider, warning) = build_provider_with_fallback(&mut config).await;
+    if let Some(w) = &warning {
+        let _ = events_tx.send(ViewEvent::ErrorText(format!("Provider: {w}")));
+    }
+    let provider: Arc<dyn Provider> = maybe_provider.unwrap_or_else(|| {
+        Arc::new(NoopProvider::new(
+            "no LLM provider configured — open Settings → Provider API keys to add one",
+        ))
+    });
     let mut agent =
         Agent::new(provider, tools.clone(), &config.model, &system).with_approver(approver.clone());
     // Respect the user's configured permission mode (project
@@ -762,6 +784,62 @@ async fn run_worker(
                 let _ = events_tx.send(ViewEvent::ErrorText(format!(
                     "[mcp] '{server_name}' failed to start: {error}"
                 )));
+            }
+            ShellInput::ReloadConfig => {
+                // Pull the on-disk settings (api_key_set may have just
+                // auto-switched the model in `.thclaws/settings.json`)
+                // and rebuild the agent's provider in place. Without
+                // this, the worker keeps holding whatever provider it
+                // built at startup — usually the placeholder NoopProvider
+                // when the user launched without any keys configured.
+                let prev_model = state.config.model.clone();
+                match crate::config::AppConfig::load() {
+                    Ok(new_config) => state.config = new_config,
+                    Err(e) => {
+                        let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                            "[reload] config load failed, keeping old: {e}"
+                        )));
+                        continue;
+                    }
+                }
+                let model_changed = state.config.model != prev_model;
+                // Preserve history when only the auth changed under the
+                // same model — wire format is unchanged. Drop history
+                // when the model itself flipped, since the new
+                // provider's message schema may not replay cleanly.
+                match state.rebuild_agent(!model_changed) {
+                    Ok(()) => {
+                        state.rebuild_system_prompt();
+                        if model_changed {
+                            // Mint a fresh session so its stored
+                            // `model` field matches the active
+                            // provider — same logic as ChangeCwd.
+                            state.session = crate::session::Session::new(
+                                &state.config.model,
+                                state.cwd.to_string_lossy(),
+                            );
+                            state.warned_file_size = false;
+                            let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
+                        }
+                        let provider_name = state.config.detect_provider().unwrap_or("unknown");
+                        let payload = serde_json::json!({
+                            "type": "provider_update",
+                            "provider": provider_name,
+                            "model": state.config.model,
+                            "provider_ready": true,
+                        });
+                        let _ = events_tx.send(ViewEvent::ProviderUpdate(payload.to_string()));
+                        let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                            "(provider reloaded: {provider_name}/{})",
+                            state.config.model
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                            "[reload] agent rebuild failed: {e}"
+                        )));
+                    }
+                }
             }
             ShellInput::ChangeCwd(new_cwd) => {
                 // Process cwd + sandbox were already updated by the GUI
@@ -1271,6 +1349,29 @@ fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
         name.to_string()
     } else {
         format!("{name} {detail}")
+    }
+}
+
+/// Placeholder provider used when the worker starts without any usable
+/// LLM credentials. `stream()` immediately errors with a
+/// configure-a-key message so the user sees actionable feedback on the
+/// first send instead of an infinitely spinning request. The agent and
+/// loop are kept alive so a `ReloadConfig` (sent by the GUI after
+/// `api_key_set`) can swap this out for a real provider in place.
+struct NoopProvider {
+    msg: String,
+}
+
+impl NoopProvider {
+    fn new(msg: impl Into<String>) -> Self {
+        Self { msg: msg.into() }
+    }
+}
+
+#[async_trait]
+impl Provider for NoopProvider {
+    async fn stream(&self, _req: StreamRequest) -> CoreResult<EventStream> {
+        Err(Error::Provider(self.msg.clone()))
     }
 }
 
