@@ -62,6 +62,7 @@ impl OpenAIProvider {
     /// Splits ToolResult blocks out as separate `role: "tool"` messages.
     fn messages_to_openai(req: &StreamRequest) -> Vec<Value> {
         let mut out: Vec<Value> = Vec::new();
+        let echo_reasoning = model_uses_reasoning_content(&req.model);
 
         if let Some(sys) = &req.system {
             if !sys.is_empty() {
@@ -77,12 +78,23 @@ impl OpenAIProvider {
             };
 
             let mut text_parts: Vec<String> = Vec::new();
+            let mut thinking_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<Value> = Vec::new();
             let mut trailing_tool_results: Vec<(String, String)> = Vec::new();
 
             for block in &m.content {
                 match block {
                     ContentBlock::Text { text } => text_parts.push(text.clone()),
+                    ContentBlock::Thinking { content, .. } => {
+                        // Only carry reasoning_content into the wire body
+                        // for models that explicitly require it. For all
+                        // other OpenAI-compat targets (gpt-4o, deepseek-v3,
+                        // qwen non-thinking, etc.), drop the block — saves
+                        // tokens and avoids surprising the server.
+                        if echo_reasoning {
+                            thinking_parts.push(content.clone());
+                        }
+                    }
                     ContentBlock::ToolUse { id, name, input } => {
                         let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
                         tool_calls.push(json!({
@@ -102,10 +114,12 @@ impl OpenAIProvider {
             }
 
             let content_text = text_parts.join("");
+            let reasoning_text = thinking_parts.join("");
             let has_text = !content_text.is_empty();
+            let has_reasoning = !reasoning_text.is_empty();
             let has_tools = !tool_calls.is_empty();
 
-            if has_text || has_tools {
+            if has_text || has_tools || has_reasoning {
                 let mut msg = json!({"role": role});
                 if has_text {
                     msg["content"] = json!(content_text);
@@ -114,6 +128,9 @@ impl OpenAIProvider {
                 }
                 if has_tools {
                     msg["tool_calls"] = json!(tool_calls);
+                }
+                if has_reasoning {
+                    msg["reasoning_content"] = json!(reasoning_text);
                 }
                 out.push(msg);
             }
@@ -384,6 +401,17 @@ pub fn parse_chunk(raw: &str, state: &mut ParseState) -> Result<Vec<ProviderEven
             }
         }
 
+        // Reasoning models (DeepSeek v4-*, OpenAI o-series via OpenRouter)
+        // emit `delta.reasoning_content` alongside `delta.content`. Capture
+        // it as a ThinkingDelta so it gets folded into a Thinking block and
+        // can be echoed back on the next turn — the server requires the
+        // prior reasoning_content in history or returns 400.
+        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+            if !reasoning.is_empty() {
+                out.push(ProviderEvent::ThinkingDelta(reasoning.to_string()));
+            }
+        }
+
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for tc in tool_calls {
                 let index = tc.get("index").and_then(Value::as_i64).unwrap_or(0);
@@ -446,6 +474,37 @@ pub fn parse_chunk(raw: &str, state: &mut ParseState) -> Result<Vec<ProviderEven
     }
 
     Ok(out)
+}
+
+/// Allowlist of OpenAI-compat model id patterns whose chat-completions API
+/// emits and requires `reasoning_content` to be echoed back in subsequent
+/// turns. Conservative by default — anything not on this list will have
+/// `Thinking` blocks dropped during serialization, so non-thinking models
+/// get exactly the same wire bytes as before this change. Add new
+/// thinking-model families here as they appear.
+///
+/// Matches by substring against the model id (after `strip_model_prefix`
+/// has run, so the `openrouter/` prefix is already removed). The bare id
+/// is what the upstream provider sees, so e.g. `deepseek/deepseek-v4-flash`
+/// is what we test against.
+pub fn model_uses_reasoning_content(model: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        // DeepSeek's v4 line — the symptom that drove this fix.
+        "deepseek/deepseek-v4",
+        "deepseek-v4",
+        // OpenAI o-series via OpenRouter (`openai/o1-mini`, `openai/o3`,
+        // etc). Direct OpenAI calls go through Responses API, not this
+        // chat-completions client, so this only catches the OpenRouter
+        // proxy form.
+        "openai/o1",
+        "openai/o3",
+        "openai/o4",
+        // DeepSeek r1 family also returns reasoning_content.
+        "deepseek/deepseek-r1",
+        "deepseek-r1",
+    ];
+    let m = model.to_lowercase();
+    PATTERNS.iter().any(|p| m.contains(p))
 }
 
 #[cfg(test)]
@@ -803,5 +862,108 @@ mod tests {
             panic!("expected ToolUse");
         }
         assert_eq!(result.stop_reason.as_deref(), Some("tool_calls"));
+    }
+
+    /// DeepSeek v4 (and OpenAI o-series via OpenRouter) emit
+    /// `delta.reasoning_content` alongside (or before) `delta.content`.
+    /// Verify the parser captures it as a `ThinkingDelta` so the assembly
+    /// pipeline can build a `ContentBlock::Thinking` for echo on later turns.
+    #[test]
+    fn parse_chunk_emits_thinking_delta_for_reasoning_content() {
+        let events = parse_all(&[
+            "data: {\"id\":\"1\",\"model\":\"deepseek/deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}",
+            "data: {\"id\":\"1\",\"model\":\"deepseek/deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}",
+            "data: {\"id\":\"1\",\"model\":\"deepseek/deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}",
+            "data: {\"id\":\"1\",\"model\":\"deepseek/deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        ]);
+        let kinds: Vec<&str> = events.iter().map(|e| match e {
+            ProviderEvent::MessageStart { .. } => "MessageStart",
+            ProviderEvent::ThinkingDelta(_) => "ThinkingDelta",
+            ProviderEvent::TextDelta(_) => "TextDelta",
+            ProviderEvent::ToolUseStart { .. } => "ToolUseStart",
+            ProviderEvent::ToolUseDelta { .. } => "ToolUseDelta",
+            ProviderEvent::ContentBlockStop => "ContentBlockStop",
+            ProviderEvent::MessageStop { .. } => "MessageStop",
+        }).collect();
+        assert_eq!(
+            kinds,
+            vec!["MessageStart", "ThinkingDelta", "TextDelta", "MessageStop"]
+        );
+        match &events[1] {
+            ProviderEvent::ThinkingDelta(s) => assert_eq!(s, "let me think"),
+            other => panic!("expected ThinkingDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_uses_reasoning_content_allowlist() {
+        // Thinking models (substring match, lowercase-insensitive).
+        assert!(model_uses_reasoning_content("deepseek/deepseek-v4-flash"));
+        assert!(model_uses_reasoning_content("deepseek/deepseek-v4-pro"));
+        assert!(model_uses_reasoning_content("deepseek-v4-flash"));
+        assert!(model_uses_reasoning_content("deepseek/deepseek-r1"));
+        assert!(model_uses_reasoning_content("openai/o1-mini"));
+        assert!(model_uses_reasoning_content("openai/o3"));
+        // Non-thinking models — every other workflow's tokens stay
+        // unaffected by this change.
+        assert!(!model_uses_reasoning_content("gpt-4o"));
+        assert!(!model_uses_reasoning_content("openai/gpt-4o"));
+        assert!(!model_uses_reasoning_content("deepseek/deepseek-v3.2"));
+        assert!(!model_uses_reasoning_content("deepseek/deepseek-chat"));
+        assert!(!model_uses_reasoning_content("anthropic/claude-sonnet-4-6"));
+        assert!(!model_uses_reasoning_content("qwen/qwen3.6-plus"));
+    }
+
+    /// For thinking models, a Thinking block in history must be echoed back
+    /// as `reasoning_content` on the assistant message. For non-thinking
+    /// models, the same block must be silently dropped (no extra tokens).
+    #[test]
+    fn messages_to_openai_echoes_reasoning_only_for_thinking_models() {
+        let history = vec![
+            Message::user("solve x"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        content: "think think".into(),
+                        signature: None,
+                    },
+                    ContentBlock::Text { text: "x = 42".into() },
+                ],
+            },
+            Message::user("now y"),
+        ];
+
+        // Thinking-model target: reasoning_content present.
+        let req = StreamRequest {
+            model: "deepseek/deepseek-v4-flash".into(),
+            system: None,
+            messages: history.clone(),
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let msgs = OpenAIProvider::messages_to_openai(&req);
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant["content"], "x = 42");
+        assert_eq!(assistant["reasoning_content"], "think think");
+
+        // Non-thinking target: reasoning_content stripped, identical wire
+        // bytes to pre-patch behavior.
+        let req_plain = StreamRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: history,
+            tools: vec![],
+            max_tokens: 100,
+            thinking_budget: None,
+        };
+        let msgs_plain = OpenAIProvider::messages_to_openai(&req_plain);
+        let assistant_plain = msgs_plain.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant_plain["content"], "x = 42");
+        assert!(
+            assistant_plain.get("reasoning_content").is_none(),
+            "non-thinking model must not see reasoning_content; got {assistant_plain:?}"
+        );
     }
 }

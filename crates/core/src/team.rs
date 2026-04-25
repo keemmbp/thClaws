@@ -18,9 +18,79 @@ use crate::error::{Error, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub const POLL_INTERVAL_MS: u64 = 1000;
+
+/// Set at session startup by `repl::run_repl_with_state`. True when this
+/// process is the team lead (team mode is on AND we're not running as a
+/// named teammate). Consulted by tools (e.g. BashTool) to apply lead-only
+/// guards. Stored as a static rather than env var so spawned teammate
+/// child processes don't accidentally inherit the flag.
+static IS_TEAM_LEAD: AtomicBool = AtomicBool::new(false);
+
+pub fn set_is_team_lead(b: bool) {
+    IS_TEAM_LEAD.store(b, Ordering::Relaxed);
+}
+
+pub fn is_team_lead() -> bool {
+    IS_TEAM_LEAD.load(Ordering::Relaxed)
+}
+
+/// True when (a) a git merge is currently in progress in the repo that
+/// `path` lives in, AND (b) `path` itself currently contains conflict
+/// markers. Used by Write/Edit to grant the team lead a narrow exception
+/// to the "no source-mutation" rule — merge-conflict resolution is the
+/// one legitimate lead-author activity. Once the lead resolves and the
+/// merge commit is made, .git/MERGE_HEAD disappears and the exception
+/// closes automatically.
+pub fn lead_resolving_merge_conflict(path: &Path) -> bool {
+    // Find the .git directory by walking up from the file's parent.
+    // (Path may be a not-yet-existing file — its parent should exist.)
+    let start = path.parent().unwrap_or(path);
+    let git_dir = match find_git_dir(start) {
+        Some(d) => d,
+        None => return false,
+    };
+    if !git_dir.join("MERGE_HEAD").exists() {
+        return false;
+    }
+    // Read the file and check for conflict markers. If the file doesn't
+    // exist yet, it can't be a conflicted file — disallow.
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    content.contains("<<<<<<<") && content.contains("=======") && content.contains(">>>>>>>")
+}
+
+/// Walk up from `start` to find the `.git` directory (or `.git` file for
+/// worktrees, in which case follow the gitdir pointer). Returns the path
+/// to the canonical git dir for that repo / worktree.
+fn find_git_dir(start: &Path) -> Option<PathBuf> {
+    let mut cur = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    loop {
+        let candidate = cur.join(".git");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if candidate.is_file() {
+            // Worktree: contains "gitdir: /abs/path/to/.git/worktrees/name".
+            let s = std::fs::read_to_string(&candidate).ok()?;
+            let line = s.lines().next()?;
+            let p = line.strip_prefix("gitdir:")?.trim();
+            return Some(PathBuf::from(p));
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
+}
 
 // ── Data structures ─────────────────────────────────────────────────
 
@@ -55,6 +125,15 @@ pub struct TeamMember {
     pub is_active: bool,
     #[serde(default)]
     pub tmux_pane_id: Option<String>,
+    /// `Some("worktree")` → SpawnTeammate auto-creates a git
+    /// worktree at `.worktrees/{name}` on branch `team/{name}`
+    /// and launches the teammate there. `None` → teammate runs in the
+    /// lead's cwd (shared tree). Previously this was only readable
+    /// from `.thclaws/agents/{name}.md` frontmatter; now also settable
+    /// declaratively via TeamCreate so ad-hoc teams don't resort to
+    /// `git worktree add` shell instructions in the prompt.
+    #[serde(default)]
+    pub isolation: Option<String>,
 }
 
 /// Old format for backward compat.
@@ -90,6 +169,7 @@ impl TeamConfig {
                     cwd: a.cwd.clone(),
                     is_active: false,
                     tmux_pane_id: None,
+                    isolation: None,
                 })
                 .collect();
         }
@@ -272,6 +352,7 @@ impl TaskQueue {
         subject: &str,
         description: &str,
         blocked_by: &[String],
+        owner: Option<&str>,
     ) -> Result<TeamTask> {
         let id = self.next_id()?;
         let now = now_secs();
@@ -279,7 +360,7 @@ impl TaskQueue {
             id: id.clone(),
             subject: subject.into(),
             description: description.into(),
-            owner: None,
+            owner: owner.map(String::from),
             status: TaskStatus::Pending,
             blocks: vec![],
             blocked_by: blocked_by.to_vec(),
@@ -329,12 +410,15 @@ impl TaskQueue {
                     task_id, task.status
                 )));
             }
-            if task.owner.is_some() {
-                return Err(Error::Tool(format!(
-                    "task {} already claimed by {}",
-                    task_id,
-                    task.owner.as_deref().unwrap_or("?")
-                )));
+            // A pre-assigned owner (set at create time by the lead) reserves the
+            // task for that agent. Other agents must not claim it.
+            if let Some(reserved) = task.owner.as_deref() {
+                if reserved != agent_id {
+                    return Err(Error::Tool(format!(
+                        "task {} is reserved for {}",
+                        task_id, reserved
+                    )));
+                }
             }
             // Check blocked_by dependencies.
             for dep_id in &task.blocked_by {
@@ -417,6 +501,13 @@ impl TaskQueue {
     pub fn claim_next(&self, agent_id: &str) -> Result<Option<TeamTask>> {
         let pending = self.list(Some(TaskStatus::Pending))?;
         for task in pending {
+            // Skip tasks the lead pre-assigned to a different agent; only
+            // consider unowned tasks or ones reserved for this agent.
+            if let Some(reserved) = task.owner.as_deref() {
+                if reserved != agent_id {
+                    continue;
+                }
+            }
             match self.claim(&task.id, agent_id) {
                 Ok(claimed) => return Ok(Some(claimed)),
                 Err(_) => continue, // race: someone else claimed it
@@ -834,9 +925,14 @@ impl Tool for TeamCreateTool {
     fn description(&self) -> &'static str {
         "Create an agent team for parallel work (thClaws native — writes \
          `.thclaws/team/config.json` in the current project root; NOT the SDK's \
-         server-side teams feature). Define agent names and roles. After \
-         creating, use SpawnTeammate to start each agent as a thClaws subprocess, \
-         and TeamTaskCreate to add tasks to a shared queue teammates can claim."
+         server-side teams feature). Define agent names, roles, and optionally \
+         `isolation: \"worktree\"` per member — if set, SpawnTeammate auto-\
+         creates a git worktree at `.worktrees/{name}` on branch \
+         `team/{name}` and launches the teammate there. DO NOT write \
+         `git worktree add …` instructions into teammate prompts — it's \
+         declarative via the isolation field, not a shell command. After \
+         creating, use SpawnTeammate to start each agent and TeamTaskCreate \
+         to add tasks to a shared queue teammates can claim."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -851,7 +947,12 @@ impl Tool for TeamCreateTool {
                         "properties": {
                             "name": {"type": "string"},
                             "role": {"type": "string"},
-                            "prompt": {"type": "string", "description": "Instructions for this agent"}
+                            "prompt": {"type": "string", "description": "Instructions for this agent. Do NOT include `git worktree add` or `cd ../…` — if you want worktree isolation, set `isolation: \"worktree\"` on this member instead."},
+                            "isolation": {
+                                "type": "string",
+                                "enum": ["worktree", "none"],
+                                "description": "If \"worktree\", SpawnTeammate auto-creates `.worktrees/{name}` on branch `team/{name}` and runs the teammate there. Default: none (shared cwd)."
+                            }
                         },
                         "required": ["name"]
                     }
@@ -872,25 +973,49 @@ impl Tool for TeamCreateTool {
             .ok_or_else(|| Error::Tool("missing agents".into()))?;
 
         let mut members = Vec::new();
+        let mut flagged_prompts: Vec<String> = Vec::new();
         for a in agents {
             let agent_name = a
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::Tool("agent missing name".into()))?;
             self.mailbox.init_agent(agent_name)?;
+            let prompt_text = a
+                .get("prompt")
+                .or(a.get("instructions"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            // Catch the common hallucination where the lead writes
+            // `git worktree add …` into the teammate prompt. We don't
+            // strip it (the model might have other reasons for
+            // mentioning git), but flag each occurrence so the
+            // response nudges the lead toward the isolation field.
+            if prompt_text.to_lowercase().contains("git worktree add")
+                || prompt_text.contains("worktree add")
+            {
+                flagged_prompts.push(agent_name.to_string());
+            }
+            // Normalise the isolation field: accept "worktree" (any
+            // case) and "none"/absent; treat other values as None so
+            // a typo doesn't silently enable isolation.
+            let isolation = a
+                .get("isolation")
+                .and_then(Value::as_str)
+                .map(str::to_lowercase)
+                .and_then(|v| match v.as_str() {
+                    "worktree" => Some("worktree".to_string()),
+                    _ => None,
+                });
             members.push(TeamMember {
                 name: agent_name.into(),
-                prompt: a
-                    .get("prompt")
-                    .or(a.get("instructions"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .into(),
+                prompt: prompt_text,
                 role: a.get("role").and_then(Value::as_str).unwrap_or("").into(),
                 color: None,
                 cwd: None,
                 is_active: false,
                 tmux_pane_id: None,
+                isolation,
             });
         }
 
@@ -908,17 +1033,46 @@ impl Tool for TeamCreateTool {
         let _ = std::fs::create_dir_all(self.mailbox.tasks_dir());
 
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
-        Ok(format!(
+        let iso_names: Vec<&str> = members
+            .iter()
+            .filter(|m| m.isolation.as_deref() == Some("worktree"))
+            .map(|m| m.name.as_str())
+            .collect();
+        let mut msg = format!(
             "Team '{}' created with agents: {}.\n\
-             Use SpawnTeammate to start each, TeamTaskCreate to add tasks.\n\n\
-             IMPORTANT: You are now the team LEAD. Your role is to COORDINATE, not implement.\n\
+             Use SpawnTeammate to start each, TeamTaskCreate to add tasks.\n",
+            name,
+            names.join(", "),
+        );
+        if !iso_names.is_empty() {
+            msg.push_str(&format!(
+                "Worktree isolation requested for: {}. SpawnTeammate will \
+                 create `.worktrees/<name>` on branch `team/<name>` \
+                 automatically — do NOT run `git worktree add` yourself.\n",
+                iso_names.join(", "),
+            ));
+        }
+        msg.push_str(
+            "\nIMPORTANT: You are now the team LEAD. Your role is to COORDINATE, not implement.\n\
              - Do NOT use Bash/Write/Edit to build code — delegate to teammates via SendMessage.\n\
              - Use TeamTaskCreate to queue work, SendMessage to assign and coordinate.\n\
              - Use Read/Glob/Grep only for review and verification.\n\
-             - If something fails, message the responsible teammate to fix it.",
-            name,
-            names.join(", ")
-        ))
+             - If something fails, message the responsible teammate to fix it.\n\
+             - Worktree isolation is a DECLARATIVE setting (`isolation: \"worktree\"` \
+               in the TeamCreate agents array). Do NOT write `git worktree add …` or \
+               `cd ../{name}` into teammate prompts — SpawnTeammate handles it.",
+        );
+        if !flagged_prompts.is_empty() {
+            msg.push_str(&format!(
+                "\n\n⚠ The prompt for {} contains `git worktree add …` — that's a \
+                 manual shell instruction the teammate will try to execute, \
+                 usually landing the worktree outside `.worktrees/`. \
+                 Consider re-running TeamCreate with the isolation field set \
+                 instead.",
+                flagged_prompts.join(", "),
+            ));
+        }
+        Ok(msg)
     }
 }
 
@@ -967,6 +1121,13 @@ impl Tool for SpawnTeammateTool {
         );
         let agent_def = agent_defs.get(name);
 
+        // Load the team config member record now (was loaded later in
+        // this function; moved up so the worktree check can also see
+        // member.isolation declaratively set by TeamCreate).
+        let config_path = self.mailbox.team_dir.join("config.json");
+        let config = TeamConfig::load(&config_path).ok();
+        let member = config.as_ref().and_then(|c| c.find_member(name)).cloned();
+
         // Send initial prompt as first inbox message.
         // If agent def has instructions, prepend them.
         let full_prompt = if let Some(def) = agent_def {
@@ -1008,24 +1169,66 @@ impl Tool for SpawnTeammateTool {
             bin, cli_flag, name, team_dir
         );
 
-        // Agent def model override: only apply if it's a full model name
-        // (e.g. "claude-sonnet-4-6", "gpt-4o"), not a short alias like "sonnet"
-        // which would force Anthropic even when the user chose a different provider.
-        // Teammates inherit the user's provider/model from settings.json by default.
+        // Agent def model override. Resolution rules:
+        //   - Full model id (contains a dash, e.g. "claude-sonnet-4-6",
+        //     "gpt-4o"): pass through as-is.
+        //   - Short alias (e.g. "sonnet", "opus", "flash"): resolve within
+        //     the project's CURRENT provider via resolve_alias_for_provider.
+        //     This keeps the team on the user's chosen provider — without it,
+        //     the global resolve_alias would surprise-switch a teammate to
+        //     native Anthropic even if the project is on OpenRouter.
+        //   - Alias that doesn't fit the current provider (e.g. "sonnet"
+        //     when provider=ollama): warn and skip — fall back to the
+        //     teammate's default config resolution.
         if let Some(def) = agent_def {
             if let Some(ref model) = def.model {
-                // Only pass --model if it looks like a full model name (contains a dash).
                 if model.contains('-') {
                     agent_cmd.push_str(&format!(" --model {}", model));
+                } else {
+                    // Short alias — resolve provider-aware.
+                    let current_provider = crate::config::AppConfig::load()
+                        .ok()
+                        .and_then(|c| c.detect_provider_kind().ok());
+                    if let Some(provider) = current_provider {
+                        match crate::providers::ProviderKind::resolve_alias_for_provider(
+                            model, provider,
+                        ) {
+                            Some(resolved) => {
+                                eprintln!(
+                                    "\x1b[33m[team] resolved agent def alias '{model}' → '{resolved}' (provider: {})\x1b[0m",
+                                    provider.name()
+                                );
+                                agent_cmd.push_str(&format!(" --model {resolved}"));
+                            }
+                            None => {
+                                eprintln!(
+                                    "\x1b[33m[team] agent def for '{name}' specifies model alias '{model}', which doesn't map to current provider '{}' — ignoring (teammate will use config default)\x1b[0m",
+                                    provider.name()
+                                );
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "\x1b[33m[team] agent def for '{name}' uses alias '{model}' but no provider is configured — ignoring\x1b[0m"
+                        );
+                    }
                 }
             }
         }
 
-        // Git worktree isolation: if agent def has `isolation: worktree`,
-        // create a git worktree for this teammate on branch `team/{name}`.
-        let worktree_path = if agent_def.and_then(|d| d.isolation.as_deref()) == Some("worktree") {
+        // Git worktree isolation: fire if either source says so —
+        //   (a) `.thclaws/agents/{name}.md` frontmatter has
+        //       `isolation: worktree` (persistent agent defs), or
+        //   (b) the team config member has `isolation: "worktree"`
+        //       (set declaratively at TeamCreate time for ad-hoc teams).
+        let iso_from_member = member
+            .as_ref()
+            .and_then(|m| m.isolation.as_deref())
+            == Some("worktree");
+        let iso_from_def = agent_def.and_then(|d| d.isolation.as_deref()) == Some("worktree");
+        let worktree_path = if iso_from_member || iso_from_def {
             let project_root = std::env::current_dir().unwrap_or_default();
-            let wt_dir = project_root.join(format!(".thclaws/worktrees/{name}"));
+            let wt_dir = project_root.join(format!(".worktrees/{name}"));
             let branch = format!("team/{name}");
 
             // Ensure project_root is a git repo — otherwise `git worktree add` fails
@@ -1040,33 +1243,42 @@ impl Tool for SpawnTeammateTool {
                 eprintln!(
                     "\x1b[33m[team] project is not a git repo — running 'git init' so worktree isolation works\x1b[0m"
                 );
-                let init = std::process::Command::new("git")
+                let _ = std::process::Command::new("git")
                     .args(["init", "-q"])
                     .current_dir(&project_root)
                     .output();
-                let has_head = std::process::Command::new("git")
-                    .args(["rev-parse", "--verify", "HEAD"])
+            }
+            // After (or independent of) `git init`, ensure HEAD exists. Worktree
+            // creation via `git worktree add <path> <branch>` requires a HEAD to
+            // branch from, and `git branch <branch>` silently no-ops in an unborn
+            // repo — so without this, the spawn fails with "invalid reference".
+            // This covers two cases the original gate missed:
+            //   (1) a pre-existing repo with zero commits (e.g. user wiped history)
+            //   (2) any other path where init ran but HEAD didn't get created
+            let has_head = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(&project_root)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !has_head {
+                eprintln!(
+                    "\x1b[33m[team] repo has no HEAD — creating empty initial commit so worktree can branch off\x1b[0m"
+                );
+                let _ = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=thclaws",
+                        "-c",
+                        "user.email=thclaws@local",
+                        "commit",
+                        "--allow-empty",
+                        "-q",
+                        "-m",
+                        "init",
+                    ])
                     .current_dir(&project_root)
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
-                if init.as_ref().map(|o| o.status.success()).unwrap_or(false) && !has_head {
-                    // Need an initial commit so worktrees can branch off HEAD.
-                    let _ = std::process::Command::new("git")
-                        .args([
-                            "-c",
-                            "user.name=thclaws",
-                            "-c",
-                            "user.email=thclaws@local",
-                            "commit",
-                            "--allow-empty",
-                            "-q",
-                            "-m",
-                            "init",
-                        ])
-                        .current_dir(&project_root)
-                        .output();
-                }
+                    .output();
             }
 
             if !wt_dir.exists() {
@@ -1110,10 +1322,13 @@ impl Tool for SpawnTeammateTool {
             None
         };
 
-        // Get cwd from: worktree > input > team config > agent def.
-        let config_path = self.mailbox.team_dir.join("config.json");
-        let config = TeamConfig::load(&config_path).ok();
-        let member = config.as_ref().and_then(|c| c.find_member(name));
+        // Get cwd from: worktree > input > team config > project root.
+        // (config + member are loaded earlier, above the worktree check.)
+        // Non-worktree teammates fall through to project_root so they land
+        // in the main repo deterministically rather than inheriting whatever
+        // shell cwd the lead happened to have. Without this, a teammate like
+        // qa (isolation: null) could drift into .worktrees/<other>/ via a
+        // single Bash `cd` and start writing files on the wrong branch.
         let project_root_str = std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
@@ -1121,12 +1336,25 @@ impl Tool for SpawnTeammateTool {
         let effective_cwd = worktree_path
             .clone()
             .or_else(|| cwd.map(String::from))
-            .or_else(|| member.and_then(|m| m.cwd.clone()));
+            .or_else(|| member.as_ref().and_then(|m| m.cwd.clone()))
+            .or_else(|| Some(project_root_str.clone()));
         // Expose the original project root so teammates in worktrees know where to
         // write shared docs / artifacts that other teammates should see.
         agent_cmd = format!(
             "THCLAWS_PROJECT_ROOT='{}' {}",
             project_root_str.replace('\'', "'\\''"),
+            agent_cmd
+        );
+        // Stub out interactive editors. Even though BashTool redirects stdin
+        // to /dev/null, programs like vi/nano/vim open /dev/tty directly to
+        // find a terminal — and a teammate running inside a tmux pane has
+        // a real tty available, so vi finds it and waits forever for human
+        // input. Setting EDITOR/GIT_EDITOR/VISUAL to `true` makes any
+        // attempted editor invocation a no-op exit-0, so e.g.
+        // `git commit -e` falls back to the message it already has and
+        // the agent's bash call returns instead of hanging the team.
+        agent_cmd = format!(
+            "EDITOR=true VISUAL=true GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true {}",
             agent_cmd
         );
         if worktree_path.is_some() {
@@ -1221,8 +1449,10 @@ impl Tool for TeamTaskCreateTool {
         "TeamTaskCreate"
     }
     fn description(&self) -> &'static str {
-        "Add a task to the team's task queue. Teammates can claim pending tasks. \
-         Use blocked_by to specify dependencies."
+        "Add a task to the team's task queue. Set `owner` to reserve the task \
+         for a specific teammate (recommended when the work is role-specific); \
+         leave it unset to make the task claimable by whoever is free first. \
+         Use `blocked_by` to specify dependencies."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1230,6 +1460,10 @@ impl Tool for TeamTaskCreateTool {
             "properties": {
                 "subject": {"type": "string", "description": "Short task title"},
                 "description": {"type": "string", "description": "Detailed instructions"},
+                "owner": {
+                    "type": "string",
+                    "description": "Teammate name to reserve this task for. Only that teammate will be able to claim it. Omit for first-come-first-served."
+                },
                 "blocked_by": {
                     "type": "array", "items": {"type": "string"},
                     "description": "Task IDs that must complete first"
@@ -1251,9 +1485,36 @@ impl Tool for TeamTaskCreateTool {
             })
             .unwrap_or_default();
 
+        let owner = input
+            .get("owner")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // Validate owner is a real team member so typos don't silently leave
+        // the task unclaimable forever.
+        if let Some(name) = owner {
+            let config_path = self.mailbox.team_dir.join("config.json");
+            let config = TeamConfig::load(&config_path)
+                .map_err(|e| Error::Tool(format!("cannot validate owner '{name}': {e}")))?;
+            if config.find_member(name).is_none() {
+                let known: Vec<&str> = config.members.iter().map(|m| m.name.as_str()).collect();
+                return Err(Error::Tool(format!(
+                    "owner '{name}' is not a team member. Known: {}",
+                    known.join(", ")
+                )));
+            }
+        }
+
         let tq = self.mailbox.task_queue();
-        let task = tq.create(subject, description, &blocked_by)?;
-        Ok(format!("Task #{} created: {}", task.id, task.subject))
+        let task = tq.create(subject, description, &blocked_by, owner)?;
+        let owner_note = owner
+            .map(|n| format!(" (reserved for {n})"))
+            .unwrap_or_default();
+        Ok(format!(
+            "Task #{} created: {}{owner_note}",
+            task.id, task.subject
+        ))
     }
 }
 
@@ -1419,7 +1680,7 @@ impl Tool for TeamMergeTool {
                 },
                 "cleanup": {
                     "type": "boolean",
-                    "description": "After a successful merge, remove the worktree at .thclaws/worktrees/<name> and delete the merged branch. Default: false."
+                    "description": "After a successful merge, remove the worktree at .worktrees/<name> and delete the merged branch. Default: false."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -1518,7 +1779,7 @@ impl Tool for TeamMergeTool {
                             "worktree",
                             "remove",
                             "--force",
-                            &format!(".thclaws/worktrees/{name}"),
+                            &format!(".worktrees/{name}"),
                         ])
                         .current_dir(&project_root)
                         .output();
@@ -1551,7 +1812,7 @@ impl Tool for TeamMergeTool {
                             "worktree",
                             "remove",
                             "--force",
-                            &format!(".thclaws/worktrees/{name}"),
+                            &format!(".worktrees/{name}"),
                         ])
                         .current_dir(&project_root)
                         .output();
@@ -1672,6 +1933,42 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// The narrow "lead may resolve a merge conflict" exception is only
+    /// active when BOTH (a) `.git/MERGE_HEAD` exists, AND (b) the target
+    /// file currently contains `<<<<<<<` / `=======` / `>>>>>>>` markers.
+    /// Both conditions are easy for an LLM to spoof in isolation, so we
+    /// require both to coincide.
+    #[test]
+    fn lead_resolving_merge_conflict_requires_both_signals() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let conflicted = repo.join("package.json");
+        std::fs::write(
+            &conflicted,
+            "<<<<<<< HEAD\n  a\n=======\n  b\n>>>>>>> branch\n",
+        )
+        .unwrap();
+        let clean = repo.join("README.md");
+        std::fs::write(&clean, "no markers here\n").unwrap();
+
+        // No MERGE_HEAD yet → exception inactive even though file has markers.
+        assert!(!lead_resolving_merge_conflict(&conflicted));
+
+        // Add MERGE_HEAD → conflicted file unlocks; clean file stays locked.
+        std::fs::write(repo.join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+        assert!(lead_resolving_merge_conflict(&conflicted));
+        assert!(!lead_resolving_merge_conflict(&clean));
+
+        // Non-existent file (e.g. lead trying to Write a fresh file
+        // mid-merge) → no markers → no exception.
+        assert!(!lead_resolving_merge_conflict(&repo.join("new-file.txt")));
+
+        // Remove MERGE_HEAD → exception closes.
+        std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
+        assert!(!lead_resolving_merge_conflict(&conflicted));
+    }
+
     #[test]
     fn mailbox_write_and_read() {
         let dir = tempdir().unwrap();
@@ -1719,13 +2016,13 @@ mod tests {
         let tq = TaskQueue::new(dir.path().join("tasks"));
 
         let t1 = tq
-            .create("build API", "Create REST endpoints", &[])
+            .create("build API", "Create REST endpoints", &[], None)
             .unwrap();
         assert_eq!(t1.id, "1");
         assert_eq!(t1.status, TaskStatus::Pending);
 
         let t2 = tq
-            .create("build UI", "Create React app", &[t1.id.clone()])
+            .create("build UI", "Create React app", &[t1.id.clone()], None)
             .unwrap();
         assert_eq!(t2.id, "2");
 
@@ -1754,8 +2051,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let tq = TaskQueue::new(dir.path().join("tasks"));
 
-        tq.create("task A", "do A", &[]).unwrap();
-        tq.create("task B", "do B", &[]).unwrap();
+        tq.create("task A", "do A", &[], None).unwrap();
+        tq.create("task B", "do B", &[], None).unwrap();
 
         let next = tq.claim_next("worker1").unwrap();
         assert!(next.is_some());
@@ -1767,6 +2064,37 @@ mod tests {
 
         let next3 = tq.claim_next("worker3").unwrap();
         assert!(next3.is_none()); // all claimed
+    }
+
+    #[test]
+    fn task_queue_preassigned_owner() {
+        let dir = tempdir().unwrap();
+        let tq = TaskQueue::new(dir.path().join("tasks"));
+
+        // Lead pre-assigns task #1 to backend; task #2 is unowned.
+        let t1 = tq
+            .create("API work", "write spec", &[], Some("backend"))
+            .unwrap();
+        assert_eq!(t1.owner.as_deref(), Some("backend"));
+        tq.create("chore", "anything", &[], None).unwrap();
+
+        // QA must not auto-claim the reserved task; it gets the unowned one.
+        let picked = tq.claim_next("qa").unwrap().unwrap();
+        assert_eq!(picked.id, "2");
+        // Complete that one so QA is no longer busy (claim's busy-check).
+        tq.complete("2", "qa").unwrap();
+
+        // QA cannot manually claim the reserved task either.
+        let err = tq.claim("1", "qa").unwrap_err();
+        assert!(
+            format!("{err}").contains("reserved for backend"),
+            "unexpected error: {err}"
+        );
+
+        // Backend can claim its reserved task.
+        let claimed = tq.claim("1", "backend").unwrap();
+        assert_eq!(claimed.status, TaskStatus::InProgress);
+        assert_eq!(claimed.owner.as_deref(), Some("backend"));
     }
 
     #[test]

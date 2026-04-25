@@ -142,6 +142,32 @@ impl Tool for BashTool {
         };
         let is_server = is_server_command(&command) && !command.trim().ends_with('&');
 
+        // Lead-only hard block. The team lead is a coordinator — destructive
+        // workspace ops have repeatedly cascade-killed teammate worktrees
+        // and processes when the LLM lead reached for `git reset --hard` or
+        // `rm -rf` to "clean up" unexpected state. The prompt rule alone is
+        // honor-system in --accept-all mode; this is the seatbelt.
+        if let Some(reason) = lead_forbidden_command(&command) {
+            return Err(Error::Tool(format!(
+                "team lead is not allowed to run this command: it would {reason}. \
+                 Lead is a COORDINATOR — destructive workspace ops belong to \
+                 teammates inside their own worktrees, never the lead. If a \
+                 merge looks weird or git state is unexpected, send a message \
+                 to the user describing what you see — do NOT attempt recovery \
+                 with `git reset`, `rm -rf`, or `git worktree remove`. Use \
+                 `git status`, `git log`, `git diff` to inspect; use TeamMerge \
+                 and SendMessage to act."
+            )));
+        }
+        // Teammate-only hard block. Catches the cross-branch `git reset
+        // --hard main` pattern that wiped frontend's worktree last run.
+        // Same-branch recovery (HEAD~N, sha) stays allowed.
+        if let Some(reason) = teammate_forbidden_command(&command) {
+            return Err(Error::Tool(format!(
+                "teammate is not allowed to run this command: it would {reason}."
+            )));
+        }
+
         if is_destructive_command(&command) {
             eprintln!(
                 "\x1b[33m⚠ destructive command detected: {}\x1b[0m",
@@ -320,6 +346,112 @@ fn needs_venv(cmd: &str) -> bool {
 /// whitespace before matching so a crafty `rm  -rf` (double-space) or
 /// tab-separated variant can't slip past the classifier just because
 /// it doesn't hit the exact ASCII byte sequence we listed.
+/// True when this process is a teammate (spawned by SpawnTeammate with
+/// `THCLAWS_TEAM_AGENT` set), as opposed to the lead or a standalone session.
+fn is_teammate_process() -> bool {
+    std::env::var("THCLAWS_TEAM_AGENT").is_ok()
+}
+
+/// Distinguish a benign `git reset --hard` ref (recovery on the teammate's
+/// own branch) from the dangerous "reset to a different branch" pattern
+/// that wiped frontend's worktree in our last run.
+///
+/// Allowed (safe): `HEAD`, `HEAD~N`, `HEAD^`, `HEAD@{N}`, hex shas (≥7 hex
+/// chars), tags (`tags/...`).
+/// Blocked: anything else — bare branch names like `main`, `master`, `dev`,
+/// remote refs like `origin/main`, sibling team branches like `team/backend`.
+fn ref_resets_to_different_branch(target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let lower = target.to_lowercase();
+    if lower == "head" || lower.starts_with("head~") || lower.starts_with("head^") {
+        return false;
+    }
+    if lower.starts_with("head@{") {
+        return false;
+    }
+    if lower.starts_with("tags/") || lower.starts_with("refs/tags/") {
+        return false;
+    }
+    // Hex SHA (full or abbreviated, ≥7 chars). Anything less is too short
+    // to disambiguate and most likely a branch name.
+    if target.len() >= 7 && target.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    true
+}
+
+/// Commands a teammate must never run. Catches the specific footguns that
+/// have wiped teammate worktrees in past runs (`git reset --hard main`,
+/// `git reset --hard origin/...`, `git reset --hard team/<sibling>`).
+/// `git reset --hard HEAD~N` and `git reset --hard <sha>` stay allowed —
+/// those are legitimate same-branch recovery moves.
+pub fn teammate_forbidden_command(cmd: &str) -> Option<&'static str> {
+    if !is_teammate_process() {
+        return None;
+    }
+    let lower = cmd.to_lowercase();
+    let collapsed: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let padded = format!(" {collapsed} ");
+
+    // Find `git reset --hard <ref>` and inspect the ref. Use the original
+    // (case-preserved) cmd to extract the ref so SHAs stay matchable.
+    if let Some(after) = padded.split(" git reset --hard ").nth(1) {
+        let target_lc = after.split_whitespace().next().unwrap_or("");
+        // Map back to the original-case token so a SHA passes the hex check.
+        let target_orig = cmd
+            .split_whitespace()
+            .skip_while(|t| t.to_lowercase() != "--hard")
+            .nth(1)
+            .unwrap_or(target_lc);
+        if ref_resets_to_different_branch(target_orig) {
+            return Some(
+                "reset to a different branch / remote ref — would discard your branch's commits and overwrite your worktree with someone else's tree. Use `git reset --hard HEAD~N` or `git reset --hard <sha>` if you genuinely need to undo your own commits, OR ask the lead to handle the merge instead",
+            );
+        }
+    }
+
+    None
+}
+
+/// Commands the team lead must never run. Returns the human-readable reason
+/// (used in the error message) or None when allowed. Always None for non-lead
+/// processes — teammates legitimately use these inside their own worktrees.
+pub fn lead_forbidden_command(cmd: &str) -> Option<&'static str> {
+    if !crate::team::is_team_lead() {
+        return None;
+    }
+    let collapsed: String = cmd.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = format!(" {collapsed} ");
+
+    let blocked: &[(&str, &str)] = &[
+        ("git reset --hard", "discard committed work via hard reset"),
+        ("git clean -f", "delete untracked files"),
+        ("git clean -d", "delete untracked directories"),
+        ("git push --force", "rewrite shared history with force-push"),
+        ("git push -f ", "rewrite shared history with force-push"),
+        ("git rebase", "rewrite committed history"),
+        ("git worktree remove", "kill a teammate's active worktree (and its process)"),
+        ("git worktree prune", "purge worktree metadata referenced by live teammates"),
+        ("git checkout -- ", "discard a teammate's uncommitted work"),
+        ("git checkout .", "discard a teammate's uncommitted work"),
+        ("git restore --worktree", "discard a teammate's uncommitted work"),
+        ("git restore .", "discard a teammate's uncommitted work"),
+        ("git merge --abort", "tear down a merge instead of resolving via the responsible teammate"),
+        ("rm -rf", "destructively remove files"),
+        ("rm -fr", "destructively remove files"),
+        ("rm -r ", "recursively remove files"),
+    ];
+
+    for (pat, why) in blocked {
+        if lower.contains(pat) {
+            return Some(why);
+        }
+    }
+    None
+}
+
 pub fn is_destructive_command(cmd: &str) -> bool {
     let raw = cmd.to_lowercase();
     // Collapse any run of whitespace (tabs, newlines, multi-space) to a
@@ -599,6 +731,85 @@ mod tests {
         assert!(!is_destructive_command("echo hello"));
         assert!(!is_destructive_command("git status"));
         assert!(!is_destructive_command("cargo test"));
+    }
+
+    /// Teammates can recover from their own mistakes on their own branch
+    /// (HEAD~N, sha) but must not reset to a different branch — that's
+    /// the pattern that wiped frontend's worktree.
+    #[test]
+    fn teammate_forbidden_command_blocks_cross_branch_reset() {
+        // Force teammate-mode by setting the env var. SAFETY: tests share
+        // the process env, so set + restore around the assertions.
+        std::env::set_var("THCLAWS_TEAM_AGENT", "frontend");
+
+        // Cross-branch / remote-ref / sibling-branch resets — block.
+        assert!(teammate_forbidden_command("git reset --hard main").is_some());
+        assert!(teammate_forbidden_command("git reset --hard master").is_some());
+        assert!(teammate_forbidden_command("git reset --hard origin/main").is_some());
+        assert!(teammate_forbidden_command("git reset --hard team/backend").is_some());
+        assert!(teammate_forbidden_command("git reset --hard dev").is_some());
+        assert!(teammate_forbidden_command("git reset --hard feature-x").is_some());
+
+        // Same-branch recovery — allowed.
+        assert!(teammate_forbidden_command("git reset --hard HEAD").is_none());
+        assert!(teammate_forbidden_command("git reset --hard HEAD~1").is_none());
+        assert!(teammate_forbidden_command("git reset --hard HEAD~3").is_none());
+        assert!(teammate_forbidden_command("git reset --hard HEAD^").is_none());
+        assert!(teammate_forbidden_command("git reset --hard HEAD@{2}").is_none());
+        assert!(teammate_forbidden_command("git reset --hard a11930a").is_none());
+        assert!(teammate_forbidden_command("git reset --hard a11930af0e9c").is_none());
+
+        // Tags — allowed.
+        assert!(teammate_forbidden_command("git reset --hard tags/v1.0").is_none());
+
+        // Other commands — allowed (they're for the destructive-warning
+        // layer, not this one).
+        assert!(teammate_forbidden_command("git status").is_none());
+        assert!(teammate_forbidden_command("rm -rf node_modules").is_none());
+
+        std::env::remove_var("THCLAWS_TEAM_AGENT");
+
+        // When NOT a teammate, every command passes — the lead and
+        // standalone sessions don't have this restriction (they have
+        // their own guards or none).
+        assert!(teammate_forbidden_command("git reset --hard main").is_none());
+    }
+
+    #[test]
+    fn lead_forbidden_command_behavior() {
+        // Tests share the AtomicBool, so toggle explicitly in this test
+        // and never rely on default state. All assertions about "off"
+        // run first and "on" later in the same test, then restore off.
+        crate::team::set_is_team_lead(false);
+        assert!(lead_forbidden_command("git reset --hard HEAD").is_none());
+        assert!(lead_forbidden_command("rm -rf /tmp/anything").is_none());
+        assert!(lead_forbidden_command("git worktree remove foo").is_none());
+        assert!(lead_forbidden_command("ls").is_none());
+
+        crate::team::set_is_team_lead(true);
+        // Every command that historically cascade-killed a team run should
+        // now return Some(reason) so BashTool can refuse it.
+        assert!(lead_forbidden_command("git reset --hard d9199ba").is_some());
+        assert!(lead_forbidden_command("git clean -fd").is_some());
+        assert!(lead_forbidden_command("git push --force").is_some());
+        assert!(lead_forbidden_command("git worktree remove .worktrees/backend").is_some());
+        assert!(lead_forbidden_command("git worktree prune").is_some());
+        assert!(lead_forbidden_command("git checkout -- src/foo.ts").is_some());
+        assert!(lead_forbidden_command("git checkout .").is_some());
+        assert!(lead_forbidden_command("git restore --worktree src/").is_some());
+        assert!(lead_forbidden_command("git merge --abort").is_some());
+        assert!(lead_forbidden_command("rm -rf docs/").is_some());
+        assert!(lead_forbidden_command("rm -fr docs/").is_some());
+        assert!(lead_forbidden_command("rm -r src/old").is_some());
+        // Non-mutating git commands the lead legitimately uses stay open.
+        assert!(lead_forbidden_command("git status").is_none());
+        assert!(lead_forbidden_command("git log --oneline").is_none());
+        assert!(lead_forbidden_command("git diff main..team/backend").is_none());
+        assert!(lead_forbidden_command("git branch -v").is_none());
+
+        // Restore default so other tests that share this static aren't
+        // surprised by lingering lead-mode behavior.
+        crate::team::set_is_team_lead(false);
     }
 
     #[test]

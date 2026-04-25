@@ -37,6 +37,16 @@ impl Tool for EditTool {
     async fn call(&self, input: Value) -> Result<String> {
         let raw_path = req_str(&input, "path")?;
         let path = crate::sandbox::Sandbox::check_write(raw_path)?;
+        // Same rationale as Write: lead is a coordinator, never the author.
+        // Narrow exception for active merge-conflict resolution — see
+        // write.rs for the full reasoning.
+        if crate::team::is_team_lead()
+            && !crate::team::lead_resolving_merge_conflict(&path)
+        {
+            return Err(Error::Tool(format!(
+                "team lead may not edit source files (path: {raw_path}). Lead is a COORDINATOR — delegate every code change to the responsible teammate via SendMessage. (Exception: when a git merge is in progress and this file has `<<<<<<<` markers, you may edit the conflict markers out. That doesn't apply here.)"
+            )));
+        }
         let old = req_str(&input, "old_string")?;
         let new = req_str(&input, "new_string")?;
         let replace_all = input

@@ -23,6 +23,7 @@ pub mod hooks;
 pub mod kms;
 pub mod mcp;
 pub mod memory;
+pub mod model_catalogue;
 pub mod oauth;
 pub mod permissions;
 pub mod plugins;

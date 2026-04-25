@@ -73,6 +73,11 @@ impl OpenAIResponsesProvider {
                             "content": text,
                         }));
                     }
+                    // Responses API has its own `reasoning` block format
+                    // (different from chat-completions' `reasoning_content`).
+                    // For now, drop — when Responses-API thinking models
+                    // are wired up, map this to `{"type":"reasoning",...}`.
+                    ContentBlock::Thinking { .. } => {}
                     ContentBlock::ToolUse { id, name, input } => {
                         out.push(json!({
                             "type": "function_call",

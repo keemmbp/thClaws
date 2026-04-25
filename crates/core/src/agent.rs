@@ -86,12 +86,20 @@ impl Agent {
         model: impl Into<String>,
         system: impl Into<String>,
     ) -> Self {
+        let model = model.into();
+        // Resolve the model's real context window from the shipped
+        // catalogue (user cache → embedded baseline → provider default
+        // → global fallback). This drives auto-compact + `/compact` +
+        // `/fork` thresholds so they match the model in use rather
+        // than a blanket hardcoded number.
+        let budget_tokens =
+            crate::model_catalogue::effective_context_window(&model) as usize;
         Self {
             provider,
             tools,
-            model: model.into(),
+            model,
             system: system.into(),
-            budget_tokens: 100_000,
+            budget_tokens,
             max_tokens: 8192,
             max_iterations: 200,
             max_retries: 3,
@@ -217,6 +225,7 @@ impl Agent {
                 let mut assembled = Box::pin(assemble(raw));
 
                 let mut turn_text = String::new();
+                let mut turn_thinking = String::new();
                 let mut turn_tool_uses: Vec<ContentBlock> = Vec::new();
                 let mut turn_stop_reason: Option<String> = None;
 
@@ -225,6 +234,15 @@ impl Agent {
                         AssembledEvent::Text(s) => {
                             turn_text.push_str(&s);
                             yield AgentEvent::Text(s);
+                        }
+                        AssembledEvent::Thinking(s) => {
+                            // Capture for persistence so it can be echoed
+                            // back next turn (DeepSeek v4 etc. require it).
+                            // Not surfaced as a separate AgentEvent yet —
+                            // existing UI consumers don't have a thinking
+                            // sink. When the GUI gets a "show reasoning"
+                            // pane, route a new event through here.
+                            turn_thinking.push_str(&s);
                         }
                         AssembledEvent::ToolUse(block) => {
                             turn_tool_uses.push(block);
@@ -238,9 +256,17 @@ impl Agent {
                     }
                 }
 
-                // Persist assistant message (text + tool_uses, in that order).
+                // Persist assistant message. Thinking comes FIRST so it
+                // mirrors the order the model emitted (reasoning then
+                // answer); some providers also expect that order in echo.
                 {
                     let mut assistant_content: Vec<ContentBlock> = Vec::new();
+                    if !turn_thinking.is_empty() {
+                        assistant_content.push(ContentBlock::Thinking {
+                            content: turn_thinking.clone(),
+                            signature: None,
+                        });
+                    }
                     if !turn_text.is_empty() {
                         assistant_content.push(ContentBlock::Text { text: turn_text.clone() });
                     }

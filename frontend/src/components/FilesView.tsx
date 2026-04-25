@@ -92,6 +92,17 @@ function isMarkdownPath(path: string): boolean {
   return e === "md" || e === "markdown";
 }
 
+// Build a same-origin URL for the custom protocol's file-asset handler.
+// Keeping path separators unencoded lets the browser treat the URL as
+// a directory structure, so relative references inside the HTML (e.g.
+// `<link href="style.css">`) resolve to sibling files on disk.
+function assetUrl(absPath: string): string {
+  const normalized = absPath.replace(/\\/g, "/");
+  const segments = normalized.split("/").map(encodeURIComponent).join("/");
+  const leadingSlash = segments.startsWith("/") ? "" : "/";
+  return `${window.location.origin}/file-asset${leadingSlash}${segments}`;
+}
+
 export function FilesView({ active }: Props) {
   const [currentPath, setCurrentPath] = useState(".");
   const [entries, setEntries] = useState<FileEntry[]>([]);
@@ -276,6 +287,7 @@ export function FilesView({ active }: Props) {
   const hasSyntaxPreview =
     preview && SYNTAX_PREVIEW.has(extOf(preview.path));
 
+
   return (
     <div className="flex h-full" style={{ background: "var(--bg-primary)" }}>
       {/* Tree panel */}
@@ -329,12 +341,12 @@ export function FilesView({ active }: Props) {
       </div>
 
       {/* Preview / editor panel */}
-      <div className="flex-1 min-h-0 flex flex-col p-4">
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col p-4">
         {preview ? (
-          <div className="flex flex-col flex-1 min-h-0">
+          <div className="flex flex-col flex-1 min-w-0 min-h-0">
             <div className="flex items-center justify-between mb-3 shrink-0 gap-2">
               <div
-                className="text-xs font-mono truncate"
+                className="text-xs font-mono truncate min-w-0 flex-1"
                 style={{ color: "var(--text-secondary)" }}
               >
                 {preview.path}
@@ -434,13 +446,28 @@ export function FilesView({ active }: Props) {
                 title={preview.path}
               />
             ) : isHtml ? (
-              <iframe
-                srcDoc={preview.content}
-                className="w-full flex-1 min-h-0 rounded border"
-                style={{ borderColor: "var(--border)", background: "var(--bg-primary)" }}
-                sandbox="allow-scripts"
-                title={preview.path}
-              />
+              isMarkdownPath(preview.path) ? (
+                // Markdown preview: backend renders MD → HTML and
+                // returns it in `content`. Use `srcDoc` so the iframe
+                // shows that HTML directly; `src={assetUrl}` would
+                // fetch the raw .md via the custom protocol and the
+                // iframe would end up blank.
+                <iframe
+                  srcDoc={preview.content}
+                  className="w-full flex-1 min-h-0 rounded border"
+                  style={{ borderColor: "var(--border)", background: "var(--bg-primary)" }}
+                  sandbox="allow-scripts"
+                  title={preview.path}
+                />
+              ) : (
+                <iframe
+                  src={assetUrl(preview.path)}
+                  className="w-full flex-1 min-h-0 rounded border"
+                  style={{ borderColor: "var(--border)", background: "var(--bg-primary)" }}
+                  sandbox="allow-scripts"
+                  title={preview.path}
+                />
+              )
             ) : hasSyntaxPreview ? (
               <CodeEditor
                 source={preview.content}

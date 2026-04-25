@@ -46,6 +46,68 @@ pub fn home_string() -> Option<String> {
     home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Render a proportional progress bar. Example:
+/// `[████████▓░░░░░░░░░░░░░░░]` for 35% over 24 cells. Half-step `▓`
+/// for fractional fills. ANSI-colored: green <60%, yellow 60–80%,
+/// red ≥80%.
+pub fn progress_bar(pct: f64, width: usize) -> String {
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled_f = clamped / 100.0 * width as f64;
+    let full = filled_f.floor() as usize;
+    let frac = filled_f - full as f64;
+    let half = if frac >= 0.5 && full < width { 1 } else { 0 };
+    let empty = width - full - half;
+    let color = if clamped >= 80.0 {
+        "\x1b[31m"
+    } else if clamped >= 60.0 {
+        "\x1b[33m"
+    } else {
+        "\x1b[32m"
+    };
+    let reset = "\x1b[0m";
+    format!(
+        "[{color}{}{}{reset}{}]",
+        "█".repeat(full),
+        "▓".repeat(half),
+        "░".repeat(empty),
+    )
+}
+
+/// Byte size in human units: `512`→`"512 B"`, `2048`→`"2.0 KB"`,
+/// `5_500_000`→`"5.2 MB"`.
+pub fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{} B", n)
+    }
+}
+
+/// Abbreviate token counts: `200000`→`"200k"`, `1_200_000`→`"1.2M"`.
+pub fn format_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        let f = n as f64 / 1_000_000.0;
+        if (f.round() - f).abs() < 0.05 {
+            format!("{}M", f.round() as u64)
+        } else {
+            format!("{:.1}M", f)
+        }
+    } else if n >= 1_000 {
+        let f = n as f64 / 1_000.0;
+        if (f.round() - f).abs() < 0.05 {
+            format!("{}k", f.round() as u64)
+        } else {
+            format!("{:.1}k", f)
+        }
+    } else {
+        n.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

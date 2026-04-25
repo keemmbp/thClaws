@@ -200,7 +200,7 @@ impl UsageTracker {
     }
 }
 
-fn today_str() -> String {
+pub(crate) fn today_str() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

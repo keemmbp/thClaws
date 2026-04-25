@@ -85,8 +85,16 @@ impl MemoryStore {
     }
 
     /// Free-form contents of `MEMORY.md` (the index file), or `None` if missing.
+    /// The index is a pointer sheet, not an archive — runaway growth silently
+    /// burns tokens on every turn. Same caps as Claude Code:
+    ///   * 200 lines (line-truncated at a natural newline boundary).
+    ///   * 25 KB (byte-truncated at the last newline under cap after the line
+    ///     pass).
+    /// When either fires, a one-line notice is appended so the user sees
+    /// *why* older entries stopped reaching the model.
     pub fn index(&self) -> Option<String> {
-        std::fs::read_to_string(self.root.join("MEMORY.md")).ok()
+        let raw = std::fs::read_to_string(self.root.join("MEMORY.md")).ok()?;
+        Some(truncate_index(&raw))
     }
 
     /// List all `*.md` files in the root (excluding `MEMORY.md`), parsed as
@@ -156,6 +164,109 @@ impl MemoryStore {
         }
         Some(parts.join("\n\n"))
     }
+}
+
+/// Byte sizes of `MEMORY.md` (index) plus per-topic entry files, used
+/// by `/context` to break down memory's contribution to the system
+/// prompt. Returns `(index_bytes, Vec<(name, bytes)> per entry)`. Any
+/// file that can't be stat'd is silently skipped — callers treat
+/// "missing" and "size 0" the same way.
+pub fn memory_sizes(store: &MemoryStore) -> (u64, Vec<(String, u64)>) {
+    let index_bytes = std::fs::metadata(store.root.join("MEMORY.md"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    if let Ok(read) = std::fs::read_dir(&store.root) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == "MEMORY.md" || !name.ends_with(".md") {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    entries.push((name.to_string(), meta.len()));
+                }
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    (index_bytes, entries)
+}
+
+/// Line cap for `MEMORY.md` — matches Claude Code's `MAX_ENTRYPOINT_LINES`.
+pub const MEMORY_INDEX_MAX_LINES: usize = 200;
+/// Byte cap for `MEMORY.md`. ~125 chars/line at the line cap; this catches
+/// long-line indexes that slip past the line count but still bloat the
+/// prompt. Matches Claude Code's `MAX_ENTRYPOINT_BYTES`.
+pub const MEMORY_INDEX_MAX_BYTES: usize = 25_000;
+
+/// Apply `MEMORY.md`'s 200-line / 25 KB caps and, when either triggered,
+/// append a single notice line so the model (and the user, if they /memory)
+/// see that older entries dropped off.
+pub fn truncate_index(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('\n');
+    let total_lines = trimmed.split('\n').count();
+    let total_bytes = trimmed.len();
+    let mut line_truncated = false;
+    let mut byte_truncated = false;
+
+    // Line pass first — natural newline boundary keeps markdown
+    // reasonable (no mid-bullet cuts).
+    let after_lines: String = if total_lines > MEMORY_INDEX_MAX_LINES {
+        line_truncated = true;
+        trimmed
+            .split('\n')
+            .take(MEMORY_INDEX_MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        trimmed.to_string()
+    };
+
+    // Byte pass: if still too fat (long-line index), cut at the last
+    // newline under the cap. The original byte count drives the "was
+    // truncated" flag so long lines still trip the warning even when
+    // the line cap happens to pass.
+    let after_bytes: String = if after_lines.len() > MEMORY_INDEX_MAX_BYTES {
+        byte_truncated = true;
+        let slice = &after_lines[..MEMORY_INDEX_MAX_BYTES];
+        match slice.rfind('\n') {
+            Some(cut) => slice[..cut].to_string(),
+            None => slice.to_string(),
+        }
+    } else if total_bytes > MEMORY_INDEX_MAX_BYTES {
+        byte_truncated = true;
+        after_lines
+    } else {
+        after_lines
+    };
+
+    if !line_truncated && !byte_truncated {
+        return after_bytes;
+    }
+
+    let mut out = after_bytes;
+    out.push_str("\n\n<!-- MEMORY.md truncated: ");
+    match (line_truncated, byte_truncated) {
+        (true, true) => out.push_str(&format!(
+            "{total_lines} lines / {total_bytes} bytes → kept first {} lines under {} byte cap.",
+            MEMORY_INDEX_MAX_LINES, MEMORY_INDEX_MAX_BYTES,
+        )),
+        (true, false) => out.push_str(&format!(
+            "{total_lines} lines → kept first {}. Move older entries into topic-named `<name>.md` files so the index stays an index.",
+            MEMORY_INDEX_MAX_LINES,
+        )),
+        (false, true) => out.push_str(&format!(
+            "{total_bytes} bytes > {} cap → kept earlier content.",
+            MEMORY_INDEX_MAX_BYTES,
+        )),
+        _ => unreachable!(),
+    }
+    out.push_str(" -->\n");
+    out
 }
 
 fn parse_entry_file(path: &Path) -> Option<MemoryEntry> {
@@ -246,6 +357,36 @@ mod tests {
         let (front, body) = parse_frontmatter(s);
         assert!(front.is_empty());
         assert_eq!(body, s);
+    }
+
+    #[test]
+    fn truncate_index_short_input_untouched() {
+        let s = "# memory\n\n- one line\n- two lines\n";
+        assert_eq!(truncate_index(s), s.trim_end_matches('\n'));
+    }
+
+    #[test]
+    fn truncate_index_caps_at_200_lines() {
+        let lines: Vec<String> =
+            (0..500).map(|i| format!("- entry {i}")).collect();
+        let s = lines.join("\n");
+        let out = truncate_index(&s);
+        // First 200 entries + notice block.
+        assert!(out.starts_with("- entry 0"));
+        assert!(out.contains("- entry 199"));
+        assert!(!out.contains("- entry 200"));
+        assert!(out.contains("MEMORY.md truncated"));
+        assert!(out.contains("500 lines"));
+    }
+
+    #[test]
+    fn truncate_index_caps_at_25kb_for_long_lines() {
+        // One line, 30 KB of text → under the line cap, over the byte cap.
+        let s: String = "x".repeat(30_000);
+        let out = truncate_index(&s);
+        assert!(out.len() < 30_000);
+        assert!(out.contains("MEMORY.md truncated"));
+        assert!(out.contains("bytes"));
     }
 
     #[test]

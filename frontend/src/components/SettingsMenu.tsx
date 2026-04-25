@@ -97,6 +97,29 @@ export function SettingsMenu({
         minWidth: "220px",
       }}
     >
+      {/* Accent-tinted hover + focus highlight. `hover:bg-white/5`
+          alone was nearly invisible on light themes and against the
+          rest of the chrome; flooding the row with the accent color
+          makes the selection unambiguous and keyboard-tabbing obvious.
+          Inner `.sm-subtle` spans reset to a translucent-white color
+          on hover so the hint text stays readable on the accent
+          background. */}
+      <style>{`
+        .sm-row {
+          background: transparent;
+          transition: background 120ms ease, color 120ms ease;
+        }
+        .sm-row:hover:not(:disabled),
+        .sm-row:focus-visible:not(:disabled) {
+          background: var(--accent);
+          color: var(--accent-fg, #ffffff) !important;
+          outline: none;
+        }
+        .sm-row:hover:not(:disabled) .sm-subtle,
+        .sm-row:focus-visible:not(:disabled) .sm-subtle {
+          color: rgba(255, 255, 255, 0.85) !important;
+        }
+      `}</style>
       {items.map((item) => (
         <button
           key={item.id}
@@ -104,13 +127,19 @@ export function SettingsMenu({
             onPick(item.id);
             onClose();
           }}
-          className="w-full text-left px-3 py-1.5 hover:bg-white/5 transition-colors flex items-center gap-2"
+          className="sm-row w-full text-left px-3 py-1.5 flex items-center gap-2"
           style={{ color: "var(--text-primary)", fontSize: "12px" }}
         >
-          <span style={{ color: "var(--text-secondary)" }}>{item.icon}</span>
+          <span
+            className="sm-subtle"
+            style={{ color: "var(--text-secondary)" }}
+          >
+            {item.icon}
+          </span>
           <div>
             <div>{item.label}</div>
             <div
+              className="sm-subtle"
               style={{ color: "var(--text-secondary)", fontSize: "10px" }}
             >
               {item.hint}
@@ -134,10 +163,15 @@ export function SettingsMenu({
           <button
             key={opt.id}
             onClick={() => setMode(opt.id)}
-            className="w-full text-left px-3 py-1.5 hover:bg-white/5 transition-colors flex items-center gap-2"
+            className="sm-row w-full text-left px-3 py-1.5 flex items-center gap-2"
             style={{ color: "var(--text-primary)", fontSize: "12px" }}
           >
-            <span style={{ color: "var(--text-secondary)" }}>{opt.icon}</span>
+            <span
+              className="sm-subtle"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              {opt.icon}
+            </span>
             <span className="flex-1">{opt.label}</span>
             {active && (
               <Check size={12} style={{ color: "var(--accent)" }} />
@@ -157,11 +191,14 @@ export function SettingsMenu({
       </div>
       <button
         onClick={toggleTeam}
-        className="w-full text-left px-3 py-1.5 hover:bg-white/5 transition-colors flex items-start gap-2"
+        className="sm-row w-full text-left px-3 py-1.5 flex items-start gap-2"
         style={{ color: "var(--text-primary)", fontSize: "12px" }}
         disabled={teamEnabled === null}
       >
-        <span style={{ color: "var(--text-secondary)", paddingTop: "1px" }}>
+        <span
+          className="sm-subtle"
+          style={{ color: "var(--text-secondary)", paddingTop: "1px" }}
+        >
           <Users size={12} />
         </span>
         <div className="flex-1">
@@ -190,6 +227,7 @@ export function SettingsMenu({
             </span>
           </div>
           <div
+            className="sm-subtle"
             style={{ color: "var(--text-secondary)", fontSize: "10px" }}
           >
             TeamCreate, SpawnTeammate, … (writes `.thclaws/settings.json`)

@@ -1,14 +1,70 @@
 import { useEffect, useRef, useState } from "react";
 import { subscribe, send } from "../hooks/useIPC";
+import { useTheme, type ResolvedTheme } from "../hooks/useTheme";
 
-const ANSI_COLORS: Record<number, string> = {
-  30: "#4d4d4d", 31: "#e06c75", 32: "#98c379", 33: "#e5c07b",
-  34: "#61afef", 35: "#c678dd", 36: "#56b6c2", 37: "#e6e6e6",
-  90: "#888", 91: "#e06c75", 92: "#98c379", 93: "#e5c07b",
-  94: "#61afef", 95: "#c678dd", 96: "#56b6c2", 97: "#ffffff",
+// Per-theme ANSI palettes. Dark-mode uses the familiar One Dark-ish
+// colors; light-mode maps the same ANSI slots to darker variants that
+// stay legible on a white background (32/green → #2a7a3a rather than
+// #98c379 which disappears into the bg, etc.).
+const ANSI_PALETTES: Record<ResolvedTheme, Record<number, string>> = {
+  dark: {
+    30: "#4d4d4d", 31: "#e06c75", 32: "#98c379", 33: "#e5c07b",
+    34: "#61afef", 35: "#c678dd", 36: "#56b6c2", 37: "#e6e6e6",
+    90: "#888", 91: "#e06c75", 92: "#98c379", 93: "#e5c07b",
+    94: "#61afef", 95: "#c678dd", 96: "#56b6c2", 97: "#ffffff",
+  },
+  light: {
+    30: "#1a1a1a", 31: "#b22a32", 32: "#2a7a3a", 33: "#a06800",
+    34: "#1f5dc0", 35: "#8b2bb2", 36: "#1f7a87", 37: "#1a1a1a",
+    90: "#7a7a7a", 91: "#b22a32", 92: "#2a7a3a", 93: "#a06800",
+    94: "#1f5dc0", 95: "#8b2bb2", 96: "#1f7a87", 97: "#000000",
+  },
 };
 
-function ansiToHtml(text: string): string {
+// Collapse runs of `[tool: X] ✓` for the same tool name into one line with
+// `×N`. Otherwise long sweeps of Ls/Read calls drown out the signal in the
+// pane. Blank lines between identical calls are swallowed so the collapsed
+// line sits flush with its neighbours. Errors (`✗`) are never collapsed —
+// they're worth seeing individually.
+function collapseToolRuns(lines: string[]): string[] {
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const okRe = /\[tool:\s*(\w+)\][^\n]*?✓/;
+
+  const out: string[] = [];
+  let group: { name: string; idx: number; count: number } | null = null;
+
+  const flush = () => {
+    if (group && group.count > 1) {
+      out[group.idx] =
+        out[group.idx].replace(/\s×\d+\s*$/, "") + ` ×${group.count}`;
+    }
+    group = null;
+  };
+
+  for (const line of lines) {
+    const bare = stripAnsi(line);
+    const m = bare.match(okRe);
+    if (m) {
+      const name = m[1];
+      if (group && group.name === name) {
+        group.count++;
+        continue;
+      }
+      flush();
+      out.push(line);
+      group = { name, idx: out.length - 1, count: 1 };
+    } else if (bare.trim() === "" && group) {
+      continue;
+    } else {
+      flush();
+      out.push(line);
+    }
+  }
+  flush();
+  return out;
+}
+
+function ansiToHtml(text: string, palette: Record<number, string>): string {
   // Escape HTML entities first.
   const escaped = text
     .replace(/&/g, "&amp;")
@@ -34,7 +90,7 @@ function ansiToHtml(text: string): string {
     for (const code of parts) {
       if (code === 1) styles.push("font-weight:bold");
       else if (code === 2 || code === 90) styles.push("opacity:0.6");
-      else if (ANSI_COLORS[code]) styles.push(`color:${ANSI_COLORS[code]}`);
+      else if (palette[code]) styles.push(`color:${palette[code]}`);
     }
     if (styles.length === 0) continue;
     // Close any prior span so styles don't stack unexpectedly.
@@ -129,6 +185,8 @@ export function TeamView() {
 function AgentPane({ agent }: { agent: AgentInfo }) {
   const [input, setInput] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
+  const { resolved: themeMode } = useTheme();
+  const palette = ANSI_PALETTES[themeMode];
 
   const lastLine = agent.output[agent.output.length - 1] ?? "";
   useEffect(() => {
@@ -150,7 +208,10 @@ function AgentPane({ agent }: { agent: AgentInfo }) {
       : "var(--accent)";
 
   return (
-    <div className="flex flex-col min-h-0" style={{ background: "#0a0a0a" }}>
+    <div
+      className="flex flex-col min-h-0"
+      style={{ background: "var(--terminal-bg)" }}
+    >
       {/* Header */}
       <div
         className="flex items-center justify-between px-2 py-1 text-[10px] font-medium shrink-0 select-none"
@@ -169,12 +230,17 @@ function AgentPane({ agent }: { agent: AgentInfo }) {
       {/* Output */}
       <div
         className="flex-1 min-h-0 overflow-y-auto p-1.5 font-mono text-[11px] leading-tight"
-        style={{ color: "var(--text-primary)" }}
+        style={{ color: "var(--terminal-fg)" }}
       >
         {agent.output.length > 0 ? (
           <div
             className="whitespace-pre-wrap break-all"
-            dangerouslySetInnerHTML={{ __html: ansiToHtml(agent.output.join("\n")) }}
+            dangerouslySetInnerHTML={{
+              __html: ansiToHtml(
+                collapseToolRuns(agent.output).join("\n"),
+                palette,
+              ),
+            }}
           />
         ) : (
           <span style={{ color: "var(--text-secondary)" }}>
@@ -209,7 +275,7 @@ function AgentPane({ agent }: { agent: AgentInfo }) {
             className="px-2 py-0.5 rounded text-[10px] font-medium"
             style={{
               background: "var(--accent-dim)",
-              color: "var(--text-primary)",
+              color: "var(--accent-fg)",
             }}
             onClick={handleSend}
           >

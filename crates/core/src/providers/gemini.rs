@@ -129,6 +129,11 @@ impl GeminiProvider {
                             parts.push(json!({"text": text}));
                         }
                     }
+                    // Gemini doesn't accept reasoning_content; drop it.
+                    // The block stays in our local history for any future
+                    // turns against a thinking model — only the wire body
+                    // strips it.
+                    ContentBlock::Thinking { .. } => {}
                     ContentBlock::ToolUse { name, input, .. } => {
                         parts.push(json!({
                             "functionCall": { "name": name, "args": input }

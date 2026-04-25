@@ -24,6 +24,45 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use tokio::sync::broadcast;
 
+/// Signal gate that holds background work (MCP spawn, other heavy
+/// startup tasks) until the frontend has finished its launch screens.
+/// Using a flag + Notify so late waiters still unblock immediately
+/// after the signal has fired.
+pub struct ReadyGate {
+    ready: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ReadyGate {
+    pub fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Resolves as soon as [`signal`] has been called (now or later).
+    pub async fn wait(&self) {
+        loop {
+            if self.ready.load(Ordering::Relaxed) {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    pub fn signal(&self) {
+        self.ready.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+}
+
+impl Default for ReadyGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Inputs to the shared session — produced by either tab.
 #[derive(Debug, Clone)]
 pub enum ShellInput {
@@ -36,6 +75,34 @@ pub enum ShellInput {
     LoadSession(String),
     /// Save the current session (window-close path).
     SaveAndQuit,
+    /// User changed the working directory via the GUI's "change directory"
+    /// modal. The harness has already updated process cwd + sandbox; the
+    /// worker reloads `ProjectConfig` from the new location, swaps the
+    /// agent's provider to whatever the new project's settings.json
+    /// specifies, and rebuilds the system prompt. Without this, the
+    /// running session keeps the model loaded at startup even though the
+    /// new project has different settings — violating the
+    /// "project settings win" contract.
+    ChangeCwd(std::path::PathBuf),
+    /// Batch of unread messages the lead's inbox poller swept — fed
+    /// into the agent as a synthetic turn so the lead actually reacts
+    /// to teammate notifications in GUI mode (the CLI REPL has its
+    /// own poller loop; this is GUI parity).
+    TeamMessages(Vec<crate::team::TeamMessage>),
+    /// A background task finished spawning an MCP server — register
+    /// its tools into the live tool registry and rebuild the agent so
+    /// the next turn sees them. This lets the worker start accepting
+    /// prompts *before* MCP spawn approval returns, instead of
+    /// blocking startup on an approval modal that hasn't mounted yet.
+    McpReady {
+        server_name: String,
+        client: std::sync::Arc<crate::mcp::McpClient>,
+        tools: Vec<crate::mcp::McpToolInfo>,
+    },
+    /// Background MCP spawn failed (approval denied, binary missing,
+    /// etc.). Surface as a `ViewEvent::ErrorText` so the user sees
+    /// *why* a configured MCP server never came online.
+    McpFailed { server_name: String, error: String },
 }
 
 /// What both tabs render. Each variant maps to a UI affordance:
@@ -50,6 +117,21 @@ pub enum ViewEvent {
     TurnDone,
     HistoryReplaced(Vec<DisplayMessage>),
     SessionListRefresh(String),
+    /// Sidebar provider/model update — carries a pre-built JSON
+    /// payload shaped like `{type: "provider_update", provider, model,
+    /// provider_ready}`. Emitted by the worker when it changes the
+    /// active model (e.g. auto-switch during `/load`) so the sidebar
+    /// reflects the new state without waiting for the 5 s config-poll.
+    ProviderUpdate(String),
+    /// Sidebar KMS list refresh — pre-built JSON payload shaped like
+    /// `{type: "kms_update", kmss: [{name, scope, active}, ...]}`.
+    /// Emitted after `/kms new | use | off` so the sidebar reflects
+    /// the new state without waiting for the next full session_update.
+    KmsUpdate(String),
+    /// The session's on-disk JSONL has crossed the fork threshold.
+    /// Frontend renders a dismissible banner with a "Fork into new
+    /// session with summary" action. Fired once per session.
+    ContextWarning { file_size_mb: f64 },
     ErrorText(String),
 }
 
@@ -74,6 +156,11 @@ impl DisplayMessage {
                     .iter()
                     .filter_map(|b| match b {
                         ContentBlock::Text { text } => Some(text.clone()),
+                        // Reasoning is model-internal scratch — don't show
+                        // it in the chat-list display. When the GUI gets a
+                        // dedicated "show thinking" toggle, surface this
+                        // there instead of the main bubble.
+                        ContentBlock::Thinking { .. } => None,
                         ContentBlock::ToolUse { name, .. } => Some(format!("[tool: {name}]")),
                         ContentBlock::ToolResult { content, .. } => {
                             let snippet: String = content.chars().take(200).collect();
@@ -97,6 +184,10 @@ pub struct SharedSessionHandle {
     pub input_tx: mpsc::Sender<ShellInput>,
     pub events_tx: broadcast::Sender<ViewEvent>,
     pub cancel: Arc<AtomicBool>,
+    /// Frontend signals this once it's past the launch modals so
+    /// deferred startup (MCP spawn, etc.) can start making user-facing
+    /// prompts. Calling `signal()` multiple times is fine.
+    pub ready_gate: Arc<ReadyGate>,
 }
 
 impl SharedSessionHandle {
@@ -123,6 +214,12 @@ pub struct WorkerState {
     pub tool_registry: ToolRegistry,
     pub system_prompt: String,
     pub cwd: PathBuf,
+    /// Approval sink attached to `agent`. Kept here so
+    /// [`Self::rebuild_agent`] can re-wire it onto the fresh Agent — a
+    /// `/model` or `/provider` swap must preserve the user's approval
+    /// UI (GUI modal vs REPL prompt) without silently falling back to
+    /// AutoApprover.
+    pub approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
     /// Shared handle into the SkillTool's internal store. `/skill
     /// install` replaces the store contents through this handle so a
     /// fresh skill is callable in the same session without restart.
@@ -131,6 +228,18 @@ pub struct WorkerState {
     /// clients whose tools are wired into `tool_registry`; dropping
     /// the Vec shuts them all down.
     pub mcp_clients: Vec<std::sync::Arc<crate::mcp::McpClient>>,
+    /// Sticky flag: once the session's on-disk JSONL crosses the fork
+    /// threshold (5 MB) we emit a single `ContextWarning` and set this
+    /// to `true`. Reset when a fresh session becomes active (new /
+    /// load / fork) so the next session starts with a clean slate.
+    pub warned_file_size: bool,
+    /// Handle to `.thclaws/team/agents/lead/output.log` — agent output
+    /// is mirrored here so the GUI Team tab can show a lead pane
+    /// alongside spawned teammates. The CLI REPL writes the same file
+    /// from its own loop; GUI-mode never runs that loop, so without
+    /// this mirror the Team tab has no lead entry. `None` inside the
+    /// mutex means the file could not be opened; writes are silent.
+    pub lead_log: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
 }
 
 impl WorkerState {
@@ -157,7 +266,8 @@ impl WorkerState {
             self.tool_registry.clone(),
             &self.config.model,
             &self.system_prompt,
-        );
+        )
+        .with_approver(self.approver.clone());
         self.agent = new_agent;
         self.agent.permission_mode = prev_perm;
         self.agent.thinking_budget = prev_thinking;
@@ -253,19 +363,35 @@ pub fn build_system_prompt(
 }
 
 pub fn spawn() -> SharedSessionHandle {
+    spawn_with_approver(std::sync::Arc::new(crate::permissions::AutoApprover))
+}
+
+/// Spawn the shared session worker with an explicit approval sink.
+/// GUI mode uses this to wire a `GuiApprover` that drives a frontend
+/// modal; the zero-arg [`spawn`] falls back to `AutoApprover` for
+/// callers that don't implement interactive approval.
+pub fn spawn_with_approver(
+    approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
+) -> SharedSessionHandle {
     let (input_tx, input_rx) = mpsc::channel::<ShellInput>();
     let (events_tx, _) = broadcast::channel::<ViewEvent>(256);
     let cancel = Arc::new(AtomicBool::new(false));
+    let ready_gate = Arc::new(ReadyGate::new());
 
     let events_tx_for_thread = events_tx.clone();
     let cancel_for_thread = cancel.clone();
+    let input_tx_for_poller = input_tx.clone();
+    let gate_for_thread = ready_gate.clone();
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(run_worker(
                 input_rx,
+                input_tx_for_poller,
                 events_tx_for_thread.clone(),
                 cancel_for_thread,
+                approver,
+                gate_for_thread,
             ));
         }));
         if let Err(payload) = result {
@@ -286,13 +412,17 @@ pub fn spawn() -> SharedSessionHandle {
         input_tx,
         events_tx,
         cancel,
+        ready_gate,
     }
 }
 
 async fn run_worker(
     input_rx: mpsc::Receiver<ShellInput>,
+    input_tx_self: mpsc::Sender<ShellInput>,
     events_tx: broadcast::Sender<ViewEvent>,
     cancel: Arc<AtomicBool>,
+    approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
+    ready_gate: Arc<ReadyGate>,
 ) {
     let cwd = std::env::current_dir().unwrap_or_default();
     let config = AppConfig::load().unwrap_or_default();
@@ -314,37 +444,103 @@ async fn run_worker(
     if team_enabled {
         let _ = crate::team::register_team_tools(&mut tools, "lead");
     }
+    // Mark this GUI worker as the team lead when team mode is on. The CLI
+    // path sets this in repl.rs; the GUI path was missing the call, which
+    // left BashTool's `lead_forbidden_command` guard inert — the LLM lead
+    // could (and did) run `rm -rf tests/`, `git reset --hard`, etc., wiping
+    // teammate work. The `&& !is_teammate()` keeps the flag off for any
+    // teammate process that happened to share this code path.
+    let is_teammate = std::env::var("THCLAWS_TEAM_AGENT").is_ok();
+    crate::team::set_is_team_lead(team_enabled && !is_teammate);
     let skill_tool = crate::skills::SkillTool::new_from_handle(skill_store.clone());
     tools.register(std::sync::Arc::new(skill_tool));
 
-    // Spawn MCP servers (project + user) and register their tools —
-    // the REPL does this at startup too, but shared_session used to
-    // skip it which meant configured MCP servers silently had no
-    // tools available in the GUI.
-    let mut mcp_clients: Vec<std::sync::Arc<crate::mcp::McpClient>> = Vec::new();
-    for server_cfg in &config.mcp_servers {
-        match crate::mcp::McpClient::spawn(server_cfg.clone()).await {
-            Ok(client) => {
-                if let Ok(tool_infos) = client.list_tools().await {
-                    for info in tool_infos {
-                        let tool = crate::mcp::McpTool::new(client.clone(), info);
-                        tools.register(std::sync::Arc::new(tool));
+    // MCP servers are spawned in background tasks so a pending
+    // approval modal can't block worker startup. The worker's main
+    // loop handles `ShellInput::McpReady` / `McpFailed` to register
+    // tools as each server comes online; until then the agent simply
+    // runs without MCP tools. Previous blocking loop meant: if the
+    // user hadn't yet clicked through the startup modal when the
+    // approval request fired, the frontend dropped the dispatch (no
+    // subscriber mounted) and the whole worker deadlocked.
+    let mcp_clients: Vec<std::sync::Arc<crate::mcp::McpClient>> = Vec::new();
+    // Give the caller's event-translator a chance to subscribe before we
+    // emit anything — tokio broadcast drops messages sent before any
+    // receiver exists, so the first handful of events at startup race
+    // against gui.rs's `spawn_event_translator`. 250 ms is plenty for
+    // the main thread to wire up the subscribe.
+    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    // …then hold here until the frontend reports its launch screens are
+    // done. Otherwise an MCP spawn approval modal can pop up *on top*
+    // of the working-directory picker before the user has even chosen
+    // a project — visible but confusing UX.
+    ready_gate.wait().await;
+    // CLAUDE.md / AGENTS.md size advisory — fire once at startup if
+    // any team-memory file is past the soft 40 KB threshold. Doesn't
+    // truncate (Claude Code also doesn't — CLAUDE.md is assumed to
+    // be worth loading in full). The nudge just surfaces "this file
+    // is large enough the model may skim past it" so the user
+    // notices and trims if they want.
+    {
+        let oversize = crate::context::scan_claude_md_oversize(&cwd);
+        for hit in oversize {
+            let kb = hit.bytes / 1024;
+            let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                "⚠ large memory file: {} ({} KB > {} KB soft cap). Consider splitting into topic files or trimming — Claude is less likely to read it carefully at this size.",
+                hit.path.display(),
+                kb,
+                crate::context::CLAUDE_MD_WARN_BYTES / 1024,
+            )));
+        }
+    }
+
+    // Daily model-catalogue refresh. Runs once per worker start if
+    // the cache is missing or older than 24 h. Fully silent — success
+    // just updates the cache, failure leaves whatever's there. The
+    // next Agent built (rebuild_agent / switch) picks up the new data.
+    tokio::spawn(async move {
+        let should_refresh = match crate::model_catalogue::cache_age() {
+            Some(age) => age > crate::model_catalogue::AUTO_REFRESH_INTERVAL,
+            None => true, // no cache yet → attempt
+        };
+        if should_refresh {
+            let _ = crate::model_catalogue::refresh_from_remote().await;
+        }
+    });
+    for server_cfg in config.mcp_servers.clone() {
+        let approver_for_spawn = approver.clone();
+        let input_tx_for_spawn = input_tx_self.clone();
+        tokio::spawn(async move {
+            let server_name = server_cfg.name.clone();
+            match crate::mcp::McpClient::spawn_with_approver(
+                server_cfg,
+                Some(approver_for_spawn),
+            )
+            .await
+            {
+                Ok(client) => match client.list_tools().await {
+                    Ok(tool_infos) => {
+                        let _ = input_tx_for_spawn.send(ShellInput::McpReady {
+                            server_name,
+                            client,
+                            tools: tool_infos,
+                        });
                     }
-                    mcp_clients.push(client);
-                } else {
-                    let _ = events_tx.send(ViewEvent::ErrorText(format!(
-                        "[mcp] list_tools failed for '{}'",
-                        server_cfg.name
-                    )));
+                    Err(e) => {
+                        let _ = input_tx_for_spawn.send(ShellInput::McpFailed {
+                            server_name,
+                            error: format!("list_tools failed: {e}"),
+                        });
+                    }
+                },
+                Err(e) => {
+                    let _ = input_tx_for_spawn.send(ShellInput::McpFailed {
+                        server_name,
+                        error: e.to_string(),
+                    });
                 }
             }
-            Err(e) => {
-                let _ = events_tx.send(ViewEvent::ErrorText(format!(
-                    "[mcp] '{}' failed to start: {e}",
-                    server_cfg.name
-                )));
-            }
-        }
+        });
     }
 
     let system = build_system_prompt(&config, &cwd, &skill_store);
@@ -356,10 +552,38 @@ async fn run_worker(
             return;
         }
     };
-    let agent = Agent::new(provider, tools.clone(), &config.model, &system);
+    let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
+        .with_approver(approver.clone());
+    // Respect the user's configured permission mode (project
+    // `.thclaws/settings.json` can set it to "ask"). Without this the
+    // GUI's Ask mode flag had no effect because the Agent was built
+    // with the default Auto.
+    agent.permission_mode = if config.permissions == "auto" {
+        crate::permissions::PermissionMode::Auto
+    } else {
+        crate::permissions::PermissionMode::Ask
+    };
 
     let session_store = SessionStore::default_path().map(SessionStore::new);
     let current_session = Session::new(&config.model, cwd.to_string_lossy());
+
+    // Lead status + output log so the Team tab can show a 'lead' pane.
+    // `run_repl` writes these from the CLI loop; in GUI mode nobody does,
+    // so all_status() came back without a lead entry and the Team tab
+    // rendered teammates only.
+    let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+    let _ = lead_mb.write_status("lead", "active", None);
+    let lead_log_path = lead_mb.output_log_path("lead");
+    if let Some(parent) = lead_log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let lead_log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lead_log_path)
+        .ok();
+    let lead_log = std::sync::Arc::new(std::sync::Mutex::new(lead_log_file));
 
     let mut state = WorkerState {
         agent,
@@ -369,9 +593,37 @@ async fn run_worker(
         tool_registry: tools,
         system_prompt: system,
         cwd,
+        approver,
         skill_store,
         mcp_clients,
+        warned_file_size: false,
+        lead_log,
     };
+
+    // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
+    // message the lead, messages pile up in `.thclaws/team/inboxes/lead.json`
+    // unread, and the team stalls waiting for the lead to react.
+    if team_enabled {
+        let poller_tx = input_tx_self.clone();
+        tokio::spawn(async move {
+            let mailbox = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+            loop {
+                let unread = mailbox.read_unread("lead").unwrap_or_default();
+                if !unread.is_empty() {
+                    let ids: Vec<String> = unread.iter().map(|m| m.id.clone()).collect();
+                    let _ = mailbox.mark_as_read("lead", &ids);
+                    if poller_tx.send(ShellInput::TeamMessages(unread)).is_err() {
+                        // Receiver dropped — session ended.
+                        return;
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    crate::team::POLL_INTERVAL_MS,
+                ))
+                .await;
+            }
+        });
+    }
 
     while let Ok(input) = input_rx.recv() {
         match input {
@@ -384,9 +636,11 @@ async fn run_worker(
                 state.agent.clear_history();
                 state.session =
                     Session::new(&state.config.model, state.cwd.to_string_lossy());
+                state.warned_file_size = false;
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
                 let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
                     &state.session_store,
+                    &state.session.id,
                 )));
             }
             ShellInput::LoadSession(id) => {
@@ -397,14 +651,166 @@ async fn run_worker(
                     )));
                     continue;
                 };
+                // If the session was recorded against a different
+                // provider than what's active, the stored messages
+                // carry wire-specific shapes (Anthropic content
+                // blocks, OpenAI tool_calls arrays, Gemini parts, …)
+                // that won't replay cleanly through another provider.
+                // Auto-switch to the session's original model. If that
+                // provider has no credentials configured, refuse the
+                // load rather than swap to something that will hard-
+                // error on the next turn.
+                let current_kind =
+                    crate::providers::ProviderKind::detect(&state.config.model);
+                let loaded_kind =
+                    crate::providers::ProviderKind::detect(&loaded.model);
+                let needs_switch =
+                    loaded_kind.is_some() && current_kind != loaded_kind;
+                if needs_switch {
+                    let Some(target_kind) = loaded_kind else { continue };
+                    if !kind_has_credentials(target_kind) {
+                        let provider_name = target_kind.name();
+                        let env_hint = target_kind
+                            .api_key_env()
+                            .map(|v| format!(" (set {v})"))
+                            .unwrap_or_default();
+                        let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                            "Can't load session '{id}' — it was recorded against {provider_name} ({}), but no API key for that provider is configured{env_hint}.",
+                            loaded.model
+                        )));
+                        continue;
+                    }
+                    // Flush whatever the active session had so we don't
+                    // lose a turn or two just because the user clicked
+                    // another session.
+                    save_history(&state.agent, &mut state.session, &state.session_store);
+                    state.config.model = loaded.model.clone();
+                    if let Err(e) = state.rebuild_agent(false) {
+                        let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                            "Auto-switch to {} failed: {e}",
+                            loaded.model
+                        )));
+                        continue;
+                    }
+                    let provider_name = target_kind.name();
+                    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                        "(auto-switched to {provider_name}/{} to match session)",
+                        loaded.model
+                    )));
+                    // Keep `.thclaws/settings.json` in sync so a
+                    // restart lands on the same provider/model.
+                    let mut project =
+                        crate::config::ProjectConfig::load().unwrap_or_default();
+                    project.set_model(&state.config.model);
+                    let _ = project.save();
+                    // Push the sidebar immediately so the Provider /
+                    // model display reflects the switch without
+                    // waiting for the 5 s config_poll.
+                    let payload = serde_json::json!({
+                        "type": "provider_update",
+                        "provider": provider_name,
+                        "model": state.config.model,
+                        "provider_ready": true,
+                    });
+                    let _ = events_tx.send(ViewEvent::ProviderUpdate(payload.to_string()));
+                }
                 state.agent.set_history(loaded.messages.clone());
                 state.session = loaded;
+                state.warned_file_size = false;
                 let display = DisplayMessage::from_messages(&state.session.messages);
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(display));
+                // Refresh so the sidebar's "current session" highlight
+                // moves to the freshly-loaded id.
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
             }
             ShellInput::SaveAndQuit => {
                 save_history(&state.agent, &mut state.session, &state.session_store);
                 break;
+            }
+            ShellInput::TeamMessages(msgs) => {
+                cancel.store(false, Ordering::Relaxed);
+                handle_team_messages(msgs, &mut state, &events_tx, &cancel).await;
+            }
+            ShellInput::McpReady {
+                server_name,
+                client,
+                tools: tool_infos,
+            } => {
+                for info in tool_infos {
+                    let tool = crate::mcp::McpTool::new(client.clone(), info);
+                    state.tool_registry.register(std::sync::Arc::new(tool));
+                }
+                state.mcp_clients.push(client);
+                // Rebuild so the agent actually sees the newly-registered
+                // MCP tools on its next turn.
+                if let Err(e) = state.rebuild_agent(true) {
+                    let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                        "[mcp] '{server_name}' tools registered but rebuild failed: {e}"
+                    )));
+                } else {
+                    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                        "[mcp] '{server_name}' connected"
+                    )));
+                }
+            }
+            ShellInput::McpFailed { server_name, error } => {
+                let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                    "[mcp] '{server_name}' failed to start: {error}"
+                )));
+            }
+            ShellInput::ChangeCwd(new_cwd) => {
+                // Process cwd + sandbox were already updated by the GUI
+                // dispatcher before sending this. Here we only refresh the
+                // worker's view: model, system prompt, session metadata.
+                let prev_model = state.config.model.clone();
+                state.cwd = new_cwd.clone();
+
+                // Reload config — `AppConfig::load` reads project settings
+                // via `ProjectConfig::project_dir()`, which honors
+                // $THCLAWS_PROJECT_ROOT first and otherwise current_dir
+                // (which the GUI just changed). Result: project settings
+                // from the NEW workspace win.
+                match crate::config::AppConfig::load() {
+                    Ok(new_config) => state.config = new_config,
+                    Err(e) => {
+                        let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                            "[cwd-change] config reload failed, keeping old: {e}"
+                        )));
+                    }
+                }
+
+                // If the model changed, rebuild the agent without history
+                // — the new provider's message schema may not match the
+                // old conversation, same logic as `/model` swap.
+                let model_changed = state.config.model != prev_model;
+                if model_changed {
+                    if let Err(e) = state.rebuild_agent(false) {
+                        let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                            "[cwd-change] agent rebuild failed: {e} (model stays on '{prev_model}')"
+                        )));
+                    } else {
+                        // Mint a fresh session — the new model's id and
+                        // empty history shouldn't share the old session.
+                        state.session = crate::session::Session::new(
+                            &state.config.model,
+                            state.cwd.to_string_lossy(),
+                        );
+                    }
+                }
+
+                // Always rebuild the system prompt — the cwd it embeds
+                // changed, even if the model didn't.
+                state.rebuild_system_prompt();
+
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                    "[cwd] {} → model: {} (was: {})",
+                    new_cwd.display(),
+                    state.config.model,
+                    prev_model
+                )));
             }
         }
     }
@@ -425,7 +831,10 @@ pub(crate) fn save_history(
     }
 }
 
-pub(crate) fn build_session_list(store: &Option<SessionStore>) -> String {
+pub(crate) fn build_session_list(
+    store: &Option<SessionStore>,
+    current_id: &str,
+) -> String {
     let sessions: Vec<serde_json::Value> = store
         .as_ref()
         .and_then(|s| s.list().ok())
@@ -441,7 +850,12 @@ pub(crate) fn build_session_list(store: &Option<SessionStore>) -> String {
             })
         })
         .collect();
-    serde_json::json!({"type": "sessions_list", "sessions": sessions}).to_string()
+    serde_json::json!({
+        "type": "sessions_list",
+        "sessions": sessions,
+        "current_id": current_id,
+    })
+    .to_string()
 }
 
 async fn handle_line(
@@ -456,6 +870,7 @@ async fn handle_line(
     }
 
     let _ = events_tx.send(ViewEvent::UserPrompt(trimmed.to_string()));
+    write_lead_log(&state.lead_log, &format!("\n\x1b[36m❯ {trimmed}\x1b[0m\n\x1b[32m"));
 
     if trimmed.starts_with('/') {
         crate::shell_dispatch::dispatch(trimmed, state, events_tx).await;
@@ -463,38 +878,198 @@ async fn handle_line(
         return;
     }
 
+    // Before each turn: if the in-memory history is over the soft
+    // threshold (80% of budget_tokens), run a cheap drop-oldest
+    // compaction and persist the checkpoint. Keeps the wire request
+    // small and the in-memory history bounded. Silent except for a
+    // dim `[compacted: …]` notice — users should know when earlier
+    // messages stop reaching the model.
+    maybe_auto_compact(state, events_tx);
+
+    let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+    let _ = lead_mb.write_status("lead", "working", None);
+
     let mut stream = Box::pin(state.agent.run_turn(trimmed.to_string()));
     while let Some(ev) = stream.next().await {
         if cancel.load(Ordering::Relaxed) {
             let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
+            write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
             save_history(&state.agent, &mut state.session, &state.session_store);
             let _ = events_tx
-                .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store)));
+                .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store, &state.session.id)));
             let _ = events_tx.send(ViewEvent::TurnDone);
+            let _ = lead_mb.write_status("lead", "active", None);
             return;
         }
         match ev {
             Ok(AgentEvent::Text(s)) => {
+                write_lead_log(&state.lead_log, &s);
                 let _ = events_tx.send(ViewEvent::AssistantTextDelta(s));
             }
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
                 let label = format_tool_label(&name, &input);
+                write_lead_log(
+                    &state.lead_log,
+                    &format!("\x1b[0m\n\x1b[90m[tool: {name}]\x1b[0m "),
+                );
                 let _ = events_tx.send(ViewEvent::ToolCallStart { name, label });
             }
             Ok(AgentEvent::ToolCallResult { name, output, .. }) => {
                 let out = output.unwrap_or_else(|e| e);
+                write_lead_log(&state.lead_log, "\x1b[90m✓\x1b[0m\n\x1b[32m");
                 let _ = events_tx.send(ViewEvent::ToolCallResult {
                     name,
                     output: out,
                 });
             }
-            Ok(AgentEvent::Done { .. }) => {
+            Ok(AgentEvent::Done { usage, .. }) => {
+                write_lead_log(&state.lead_log, "\x1b[0m\n");
+                let _ = lead_mb.write_status("lead", "active", None);
+                // Record token usage for /usage (parity with the CLI
+                // REPL — option C's chat port missed this, so the
+                // GUI shell silently dropped every turn's usage
+                // regardless of provider).
+                let provider_name =
+                    state.config.detect_provider().unwrap_or("unknown");
+                let tracker = crate::usage::UsageTracker::new(
+                    crate::usage::UsageTracker::default_path(),
+                );
+                tracker.record(provider_name, &state.config.model, &usage);
+
                 save_history(&state.agent, &mut state.session, &state.session_store);
+                maybe_warn_file_size(state, events_tx);
                 let _ = events_tx
-                    .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store)));
+                    .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store, &state.session.id)));
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
             Err(e) => {
+                write_lead_log(
+                    &state.lead_log,
+                    &format!("\x1b[0m\n\x1b[33merror: {e}\x1b[0m\n"),
+                );
+                let _ = lead_mb.write_status("lead", "active", None);
+                let _ = events_tx.send(ViewEvent::ErrorText(format!("Error: {e}")));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn write_lead_log(
+    log: &std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    s: &str,
+) {
+    use std::io::Write;
+    if let Ok(mut guard) = log.lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = f.write_all(s.as_bytes());
+            let _ = f.flush();
+        }
+    }
+}
+
+async fn handle_team_messages(
+    msgs: Vec<crate::team::TeamMessage>,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    cancel: &Arc<AtomicBool>,
+) {
+    if msgs.is_empty() {
+        return;
+    }
+
+    // UI-friendly header (chat/terminal) — don't dump the raw XML wrappers.
+    let senders: Vec<String> = {
+        let mut seen = Vec::<String>::new();
+        for m in &msgs {
+            if !seen.iter().any(|s| s == &m.from) {
+                seen.push(m.from.clone());
+            }
+        }
+        seen
+    };
+    let header = format!("[teammate messages from: {}]", senders.join(", "));
+    let _ = events_tx.send(ViewEvent::SlashOutput(header.clone()));
+    write_lead_log(&state.lead_log, &format!("\n\x1b[36m{header}\x1b[0m\n"));
+    for m in &msgs {
+        let preview: String = m.content().chars().take(300).collect();
+        write_lead_log(
+            &state.lead_log,
+            &format!("\x1b[36m[from {}]\x1b[0m {}\n", m.from, preview),
+        );
+    }
+    write_lead_log(&state.lead_log, "\x1b[32m");
+
+    // Agent-facing prompt — same XML framing repl.rs uses so the model
+    // sees a consistent format for teammate reports across CLI and GUI.
+    let combined: Vec<String> = msgs
+        .iter()
+        .map(|m| {
+            let summary = m.summary.as_deref().unwrap_or("");
+            format!(
+                "<teammate_message from=\"{}\" summary=\"{}\">\n{}\n</teammate_message>",
+                m.from,
+                summary,
+                m.content()
+            )
+        })
+        .collect();
+    let prompt = combined.join("\n\n");
+
+    let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+    let _ = lead_mb.write_status("lead", "working", None);
+
+    let mut stream = Box::pin(state.agent.run_turn(prompt));
+    while let Some(ev) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
+            write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
+            save_history(&state.agent, &mut state.session, &state.session_store);
+            let _ = events_tx
+                .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store, &state.session.id)));
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            let _ = lead_mb.write_status("lead", "active", None);
+            return;
+        }
+        match ev {
+            Ok(AgentEvent::Text(s)) => {
+                write_lead_log(&state.lead_log, &s);
+                let _ = events_tx.send(ViewEvent::AssistantTextDelta(s));
+            }
+            Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
+                let label = format_tool_label(&name, &input);
+                write_lead_log(
+                    &state.lead_log,
+                    &format!("\x1b[0m\n\x1b[90m[tool: {name}]\x1b[0m "),
+                );
+                let _ = events_tx.send(ViewEvent::ToolCallStart { name, label });
+            }
+            Ok(AgentEvent::ToolCallResult { name, output, .. }) => {
+                let out = output.unwrap_or_else(|e| e);
+                write_lead_log(&state.lead_log, "\x1b[90m✓\x1b[0m\n\x1b[32m");
+                let _ = events_tx.send(ViewEvent::ToolCallResult { name, output: out });
+            }
+            Ok(AgentEvent::Done { usage, .. }) => {
+                write_lead_log(&state.lead_log, "\x1b[0m\n");
+                let _ = lead_mb.write_status("lead", "active", None);
+                let provider_name = state.config.detect_provider().unwrap_or("unknown");
+                let tracker =
+                    crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
+                tracker.record(provider_name, &state.config.model, &usage);
+                save_history(&state.agent, &mut state.session, &state.session_store);
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+            }
+            Err(e) => {
+                write_lead_log(
+                    &state.lead_log,
+                    &format!("\x1b[0m\n\x1b[33merror: {e}\x1b[0m\n"),
+                );
+                let _ = lead_mb.write_status("lead", "active", None);
                 let _ = events_tx.send(ViewEvent::ErrorText(format!("Error: {e}")));
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
@@ -615,6 +1190,15 @@ fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
          3. Use `Read`/`Glob`/`Grep` only for review and verification.\n\
          4. Watch `CheckInbox` / `TeamStatus` between coordination rounds.\n\
          \n\
+         **Worktree isolation is declarative.** If a teammate should work on \
+         an isolated branch, set `isolation: \"worktree\"` on that member when \
+         you call `TeamCreate`. `SpawnTeammate` then creates \
+         `.worktrees/{name}` on branch `team/{name}` automatically and \
+         launches the teammate there. DO NOT write `git worktree add …` or \
+         `cd ../{name}` into teammate prompts — the teammate will execute them \
+         as shell and the worktree will land somewhere wrong (project root, a \
+         sibling dir) and be invisible to `TeamMerge`.\n\
+         \n\
          # CRITICAL: do NOT call Claude Code's Agent SDK team tools\n\n\
          Your training data contains references to an Anthropic Managed Agents \
          SDK server-side toolset (`agent_toolset_20260401`) that ships its own \
@@ -688,4 +1272,83 @@ fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
     } else {
         format!("{name} {detail}")
     }
+}
+
+/// True if this provider is usable without further setup — either
+/// because the env var holding its API key is set, or because it
+/// doesn't need one (Ollama variants, Agent SDK using Claude Code's
+/// own auth). Mirrors `gui::kind_has_credentials` without the
+/// `#[cfg(feature = "gui")]` gate so the shared worker can call it.
+fn kind_has_credentials(kind: crate::providers::ProviderKind) -> bool {
+    use crate::providers::ProviderKind;
+    match kind {
+        ProviderKind::AgentSdk => true,
+        ProviderKind::Ollama | ProviderKind::OllamaAnthropic => true,
+        other => other
+            .api_key_env()
+            .map(|v| std::env::var(v).is_ok())
+            .unwrap_or(false),
+    }
+}
+
+/// Auto-compact at 80% of `agent.budget_tokens`. Cheap drop-oldest
+/// (no LLM call), persists a checkpoint event so the next `/load`
+/// starts from the compacted view. Emits a dim `[compacted: N → M]`
+/// slash-output so the user knows earlier messages dropped out of the
+/// provider's context window.
+pub(crate) fn maybe_auto_compact(
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let history = state.agent.history_snapshot();
+    if history.is_empty() {
+        return;
+    }
+    let budget = state.agent.budget_tokens;
+    let current = crate::compaction::estimate_messages_tokens(&history);
+    let threshold = (budget as f64 * 0.8) as usize;
+    if current <= threshold {
+        return;
+    }
+    // Target a shrink to ~50% of budget so we don't retrigger
+    // on the very next turn just because we added one more.
+    let target = budget / 2;
+    let compacted = crate::compaction::compact(&history, target);
+    if compacted.len() >= history.len() {
+        // `compact()` couldn't find anywhere to trim (e.g. all
+        // history is one big recent turn). Nothing to persist.
+        return;
+    }
+    state.agent.set_history(compacted.clone());
+    if let Some(store) = &state.session_store {
+        let path = store.path_for(&state.session.id);
+        let _ = state.session.append_compaction_to(&path, &compacted);
+    }
+    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+        "[compacted: {} → {} messages — context over 80% of budget]",
+        history.len(),
+        compacted.len()
+    )));
+}
+
+/// 5 MB fork suggestion. Checks the session file's byte size after
+/// saves. Fires [`ViewEvent::ContextWarning`] exactly once per
+/// session (sticky `warned_file_size` flag on WorkerState).
+pub(crate) fn maybe_warn_file_size(
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    if state.warned_file_size {
+        return;
+    }
+    const THRESHOLD_BYTES: u64 = 5 * 1024 * 1024;
+    let Some(store) = &state.session_store else { return };
+    let path = store.path_for(&state.session.id);
+    let Ok(meta) = std::fs::metadata(&path) else { return };
+    if meta.len() < THRESHOLD_BYTES {
+        return;
+    }
+    state.warned_file_size = true;
+    let mb = meta.len() as f64 / (1024.0 * 1024.0);
+    let _ = events_tx.send(ViewEvent::ContextWarning { file_size_mb: mb });
 }

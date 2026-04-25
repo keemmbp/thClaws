@@ -49,6 +49,62 @@ impl OllamaProvider {
         req_model.strip_prefix("ollama/").unwrap_or(req_model)
     }
 
+    /// `POST /api/show` — returns the chosen context window for `model` so
+    /// callers can cache it in the catalogue. Prefers `parameters.num_ctx`
+    /// (what this Ollama instance will actually accept per turn) and falls
+    /// back to `model_info.<arch>.context_length` (the model's native
+    /// ceiling). Returns `(context, source_note)` where `source_note` is
+    /// `"num_ctx"` or `"native"` — useful for the catalogue's `source` field.
+    pub async fn show(&self, model: &str) -> Result<(u32, &'static str)> {
+        let name = Self::model_name(model);
+        let url = format!("{}/api/show", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .post(&url)
+            .json(&json!({ "model": name }))
+            .send()
+            .await
+            .map_err(|e| Error::Provider(format!("ollama /api/show http: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Provider(format!("ollama /api/show {status}: {text}")));
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Provider(format!("ollama /api/show json: {e}")))?;
+
+        // `parameters` is a space-separated string like "num_ctx 8192\nstop ...".
+        if let Some(params) = v.get("parameters").and_then(Value::as_str) {
+            for line in params.lines() {
+                let mut it = line.split_whitespace();
+                if it.next() == Some("num_ctx") {
+                    if let Some(n) = it.next().and_then(|s| s.parse::<u32>().ok()) {
+                        return Ok((n, "num_ctx"));
+                    }
+                }
+            }
+        }
+
+        // `model_info` is an object with keys like `llama.context_length`,
+        // `qwen2.context_length`, `phi3.context_length` — one per model
+        // architecture. Scan values for the first `<arch>.context_length`.
+        if let Some(info) = v.get("model_info").and_then(Value::as_object) {
+            for (k, val) in info {
+                if k.ends_with(".context_length") {
+                    if let Some(n) = val.as_u64() {
+                        return Ok((n as u32, "native"));
+                    }
+                }
+            }
+        }
+
+        Err(Error::Provider(
+            "ollama /api/show did not report context_length".into(),
+        ))
+    }
+
     fn messages_to_ollama(req: &StreamRequest) -> Vec<Value> {
         let mut out: Vec<Value> = Vec::new();
 
@@ -72,6 +128,10 @@ impl OllamaProvider {
             for block in &m.content {
                 match block {
                     ContentBlock::Text { text } => text_parts.push(text.clone()),
+                    // Ollama's chat API has no reasoning_content field.
+                    // Drop the block — it stays in our local history but
+                    // doesn't go on the wire.
+                    ContentBlock::Thinking { .. } => {}
                     ContentBlock::ToolUse { name, input, .. } => {
                         tool_calls.push(json!({
                             "function": { "name": name, "arguments": input },
@@ -450,6 +510,79 @@ mod tests {
         let body = OllamaProvider::build_body(&req);
         assert_eq!(body["model"], "llama3.2");
         assert_eq!(body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn show_prefers_num_ctx_over_native() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `num_ctx` in parameters wins — that's what the instance will
+        // actually accept per turn, regardless of the model's native ceiling.
+        let body = r#"{
+            "parameters": "num_ctx 8192\nstop \"</s>\"\ntemperature 0.7",
+            "model_info": {
+                "llama.context_length": 131072
+            }
+        }"#;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new().with_base_url(server.uri());
+        let (ctx, which) = provider.show("llama3.2").await.expect("show");
+        assert_eq!(ctx, 8192);
+        assert_eq!(which, "num_ctx");
+    }
+
+    #[tokio::test]
+    async fn show_falls_back_to_native_context_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // No `num_ctx` in parameters → fall through to model_info native.
+        let body = r#"{
+            "parameters": "stop \"</s>\"\ntemperature 0.7",
+            "model_info": {
+                "qwen2.context_length": 32768
+            }
+        }"#;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new().with_base_url(server.uri());
+        let (ctx, which) = provider.show("qwen2.5:7b").await.expect("show");
+        assert_eq!(ctx, 32768);
+        assert_eq!(which, "native");
+    }
+
+    #[tokio::test]
+    async fn show_strips_ollama_prefix_from_model_id() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use serde_json::json;
+
+        let server = MockServer::start().await;
+        let body = r#"{"parameters":"num_ctx 4096"}"#;
+        // Verify the request body contains the BARE model name, not the
+        // `ollama/` prefix the user typed.
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .and(body_partial_json(json!({"model": "llama3.2"})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new().with_base_url(server.uri());
+        let (ctx, _) = provider.show("ollama/llama3.2").await.expect("show");
+        assert_eq!(ctx, 4096);
     }
 
     #[tokio::test]

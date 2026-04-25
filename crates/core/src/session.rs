@@ -53,6 +53,30 @@ struct RenameEvent {
     timestamp: u64,
 }
 
+/// Append-only checkpoint marking that the preceding message events
+/// have been compacted (via `/compact` or similar). On load, the most
+/// recent checkpoint "wins" — its `messages` list is used as the
+/// starting history and any `message` events *after* it are appended.
+/// Everything before the checkpoint is preserved on disk for audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactionEvent {
+    #[serde(rename = "type")]
+    kind: String, // always "compaction"
+    messages: Vec<CompactedMessage>,
+    /// How many message events preceded this checkpoint — informational
+    /// only; load logic walks the JSONL sequentially and resets on each
+    /// checkpoint, so this isn't strictly required.
+    #[serde(default)]
+    replaces_count: usize,
+    timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactedMessage {
+    role: String,
+    content: Vec<crate::types::ContentBlock>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -213,6 +237,40 @@ impl Session {
                 } else {
                     Some(trimmed.to_string())
                 };
+            } else if kind == "compaction" {
+                // Replay checkpoint: everything accumulated so far is
+                // archived-on-disk but gets replaced in memory by the
+                // checkpoint's messages. Later `message` events in
+                // the same file still append after this point.
+                let ev: CompactionEvent = serde_json::from_value(val).map_err(|e| {
+                    Error::Config(format!(
+                        "session compaction parse ({}:{}): {e}",
+                        path.display(),
+                        line_num + 1
+                    ))
+                })?;
+                if ev.timestamp > last_timestamp {
+                    last_timestamp = ev.timestamp;
+                }
+                messages.clear();
+                for cm in ev.messages {
+                    let role = match cm.role.as_str() {
+                        "user" => crate::types::Role::User,
+                        "assistant" => crate::types::Role::Assistant,
+                        "system" => crate::types::Role::System,
+                        other => {
+                            return Err(Error::Config(format!(
+                                "session compaction ({}:{}): unknown role '{other}'",
+                                path.display(),
+                                line_num + 1
+                            )))
+                        }
+                    };
+                    messages.push(Message {
+                        role,
+                        content: cm.content,
+                    });
+                }
             } else {
                 // Message event line
                 let event: MessageEvent = serde_json::from_value(val).map_err(|e| {
@@ -269,6 +327,48 @@ impl Session {
             title,
             last_saved_count: msg_count,
         })
+    }
+
+    /// Write a compaction checkpoint to the JSONL and set the session's
+    /// in-memory state so that subsequent `append_to` calls only emit
+    /// messages added *after* the checkpoint. The raw message events
+    /// that preceded the checkpoint stay on disk (audit trail) but will
+    /// be overridden by the checkpoint on load.
+    pub fn append_compaction_to(
+        &mut self,
+        path: &Path,
+        compacted: &[Message],
+    ) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let compacted_payload: Vec<CompactedMessage> = compacted
+            .iter()
+            .map(|m| CompactedMessage {
+                role: match m.role {
+                    crate::types::Role::User => "user".into(),
+                    crate::types::Role::Assistant => "assistant".into(),
+                    crate::types::Role::System => "system".into(),
+                },
+                content: m.content.clone(),
+            })
+            .collect();
+        let event = CompactionEvent {
+            kind: "compaction".into(),
+            messages: compacted_payload,
+            replaces_count: self.last_saved_count,
+            timestamp: now_secs(),
+        };
+        let line = serde_json::to_string(&event)?;
+        writeln!(file, "{}", line)?;
+        // Drop the in-memory history down to the compacted view so
+        // subsequent `append_to` calls start fresh at index 0 and only
+        // append new turns produced *after* the checkpoint.
+        self.messages = compacted.to_vec();
+        self.last_saved_count = self.messages.len();
+        self.updated_at = event.timestamp;
+        Ok(())
     }
 
     /// Append a rename event to the session file. Empty / whitespace-only
@@ -493,6 +593,20 @@ impl SessionStore {
         let mut session = Session::load_from(&path)?;
         session.append_rename_to(&path, title)?;
         Ok(session)
+    }
+
+    /// Delete a session from disk. Returns Ok if removed or already
+    /// gone (idempotent), Err if the id is malformed or fs::remove_file
+    /// fails for a real reason (permissions, etc.).
+    pub fn delete(&self, id: &str) -> Result<()> {
+        Self::validate_id(id)?;
+        let path = self.path_for(id);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                Error::Config(format!("failed to delete session '{id}': {e}"))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -766,6 +880,68 @@ mod tests {
         store.rename(&id, "").unwrap();
         let cleared = store.load(&id).unwrap();
         assert_eq!(cleared.title, None);
+    }
+
+    #[test]
+    fn compaction_checkpoint_replays_on_load() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        // Start a session with 6 messages (3 turns).
+        let mut s = Session::new("m", "/tmp");
+        for i in 0..6 {
+            let role = if i % 2 == 0 {
+                crate::types::Role::User
+            } else {
+                crate::types::Role::Assistant
+            };
+            s.messages.push(Message {
+                role,
+                content: vec![crate::types::ContentBlock::Text {
+                    text: format!("msg-{i}"),
+                }],
+            });
+        }
+        store.save(&mut s).unwrap();
+
+        // Write a compaction checkpoint collapsing the first 4 into 1 summary.
+        let path = store.path_for(&s.id);
+        let compacted = vec![
+            Message {
+                role: crate::types::Role::User,
+                content: vec![crate::types::ContentBlock::Text {
+                    text: "[summary] first two turns".into(),
+                }],
+            },
+            s.messages[4].clone(),
+            s.messages[5].clone(),
+        ];
+        s.append_compaction_to(&path, &compacted).unwrap();
+
+        // Add one fresh message post-checkpoint and save.
+        s.messages.push(Message {
+            role: crate::types::Role::User,
+            content: vec![crate::types::ContentBlock::Text {
+                text: "msg-6".into(),
+            }],
+        });
+        store.save(&mut s).unwrap();
+
+        // Load: checkpoint + msg-6, not the original 7.
+        let loaded = store.load(&s.id).unwrap();
+        assert_eq!(loaded.messages.len(), 4);
+        match &loaded.messages[0].content[0] {
+            crate::types::ContentBlock::Text { text } => {
+                assert!(text.contains("[summary]"));
+            }
+            _ => panic!("expected summary text"),
+        }
+        match &loaded.messages[3].content[0] {
+            crate::types::ContentBlock::Text { text } => {
+                assert_eq!(text, "msg-6");
+            }
+            _ => panic!("expected msg-6"),
+        }
     }
 
     #[test]

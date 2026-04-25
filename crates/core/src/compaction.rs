@@ -18,6 +18,7 @@ pub fn estimate_message_tokens(m: &Message) -> usize {
     for block in &m.content {
         match block {
             ContentBlock::Text { text } => chunks.push(text.clone()),
+            ContentBlock::Thinking { content, .. } => chunks.push(content.clone()),
             ContentBlock::ToolUse { name, input, .. } => {
                 chunks.push(name.clone());
                 chunks.push(input.to_string());
@@ -161,6 +162,12 @@ fn render_for_summary(messages: &[Message]) -> String {
             .iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(text.clone()),
+                // Drop reasoning from compaction summaries — it's
+                // model-internal scratch work, not part of the user-visible
+                // conversation. The compactor's goal is to preserve "what
+                // happened" for later context, and the answer/tool calls
+                // capture that without the chain-of-thought noise.
+                ContentBlock::Thinking { .. } => None,
                 ContentBlock::ToolUse { name, input, .. } => {
                     Some(format!("[Called tool: {name} with {}]", input))
                 }

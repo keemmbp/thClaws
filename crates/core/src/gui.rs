@@ -28,11 +28,17 @@ use tao::window::WindowBuilder;
 use wry::http::Response;
 use wry::WebViewBuilder;
 
-/// use native cross-platform crates like rfd (Rust Native File Dialog) rather than spawn shell script
-use rfd::FileDialog;
-
-/// use native cross-platform Crate native_dialog rather than spawn shell script
+// Native cross-platform file/dialog crates — replace the per-platform
+// shell-out paths (osascript / zenity / PowerShell) used by
+// pick_directory_native and the Windows branch of native_confirm.
+// Backported from public repo (commits 0c592ab + 7339bc0) so Windows
+// users get a working folder picker + confirm dialog via Win32 instead
+// of a brittle PowerShell escape-fest. native_dialog is only consulted
+// from the Windows branch of native_confirm; gate its import too so
+// macOS/Linux builds don't warn about unused imports.
+#[cfg(target_os = "windows")]
 use native_dialog::{DialogBuilder, MessageLevel};
+use rfd::FileDialog;
 
 /// Embed the single-file React frontend (JS+CSS inlined by vite-plugin-singlefile).
 const FRONTEND_HTML: &str = include_str!("../../../frontend/dist/index.html");
@@ -77,9 +83,19 @@ fn spawn_event_translator(
                             let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
                         }
                         if let Some(ansi) = render_terminal_ansi(&ev) {
-                            let _ = proxy.send_event(UserEvent::Dispatch(
-                                terminal_data_envelope(&ansi),
-                            ));
+                            // HistoryReplaced needs a distinct envelope
+                            // so the frontend always re-renders the
+                            // prompt at the end — empty-history loads
+                            // (new session / loaded session with no
+                            // messages) otherwise leave the terminal
+                            // with no `❯ ` and the user has to press a
+                            // key before they realize it's responsive.
+                            let envelope = if matches!(ev, ViewEvent::HistoryReplaced(_)) {
+                                terminal_history_replaced_envelope(&ansi)
+                            } else {
+                                terminal_data_envelope(&ansi)
+                            };
+                            let _ = proxy.send_event(UserEvent::Dispatch(envelope));
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -151,6 +167,13 @@ fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             .to_string()]
         }
         ViewEvent::SessionListRefresh(json) => vec![json.clone()],
+        ViewEvent::ProviderUpdate(json) => vec![json.clone()],
+        ViewEvent::KmsUpdate(json) => vec![json.clone()],
+        ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
+            "type": "chat_context_warning",
+            "file_size_mb": file_size_mb,
+        })
+        .to_string()],
         ViewEvent::ErrorText(text) => vec![serde_json::json!({
             "type": "chat_text_delta",
             "text": format!("\n{}\n", strip_ansi(text)),
@@ -338,6 +361,12 @@ fn render_terminal_ansi(ev: &ViewEvent) -> Option<String> {
             Some(format!("\r\n\x1b[31m{text}\x1b[0m\r\n"))
         }
         ViewEvent::SessionListRefresh(_) => None,
+        ViewEvent::ProviderUpdate(_) => None,
+        ViewEvent::KmsUpdate(_) => None,
+        ViewEvent::ContextWarning { file_size_mb } => Some(format!(
+            "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
+            file_size_mb
+        )),
     }
 }
 
@@ -345,6 +374,16 @@ fn terminal_data_envelope(ansi: &str) -> String {
     let bytes = ansi.as_bytes();
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     serde_json::json!({"type": "terminal_data", "data": b64}).to_string()
+}
+
+/// Like `terminal_data_envelope` but the frontend handler always
+/// writes a fresh prompt at the end — used for session load / new-
+/// session events so an empty history doesn't leave the user staring
+/// at a blank terminal with no chevron.
+fn terminal_history_replaced_envelope(ansi: &str) -> String {
+    let bytes = ansi.as_bytes();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    serde_json::json!({"type": "terminal_history_replaced", "data": b64}).to_string()
 }
 
 /// Convert a markdown string to a full standalone HTML document so the
@@ -502,14 +541,20 @@ fn save_theme(mode: &str) {
     let _ = std::fs::write(path, serde_json::to_string_pretty(&payload).unwrap_or_default());
 }
 
+/// Convert a frontend-supplied path (always slash-separated, since it
+/// comes from JSON / the React tree) to the OS-native form before
+/// passing it to filesystem APIs. No-op on macOS/Linux. On Windows,
+/// translates `/` → `\` so paths like `src/api/foo.ts` resolve via
+/// `Sandbox::check` instead of being rejected as malformed.
+/// Backported from public repo (commit 8ad6f80).
 fn ospath(path: &str) -> String {
     #[cfg(not(target_os = "windows"))]
     {
-      return path.to_string();
+        path.to_string()
     }
     #[cfg(target_os = "windows")]
     {
-      return path.replace("/", "\\");
+        path.replace('/', "\\")
     }
 }
 
@@ -572,44 +617,37 @@ fn native_confirm(title: &str, message: &str, yes_label: &str, no_label: &str) -
         // MessageBox button labels are fixed ("Yes"/"No") by the OS; the
         // message string has to carry the yes/no semantics. Prefix the
         // user's label onto the message so they know which button does
-        // what.
+        // what. Backported from public repo (commit 7339bc0): replaces
+        // PowerShell shell-out with the `native_dialog` crate, dodging
+        // PowerShell's quote-escaping quirks.
         let prompt = format!(
             "{}\n\nYes = {}   No = {}",
-            message,
-            yes_label,
-            no_label,
+            message, yes_label, no_label,
         );
-
-        let result = DialogBuilder::message()
-          .set_level(MessageLevel::Info)
-          .set_title(title)
-          .set_text(prompt)
-          .confirm() // This returns a boolean directly, no .show() needed
-          .show()
-          .unwrap();
-
-        return result;
+        DialogBuilder::message()
+            .set_level(MessageLevel::Info)
+            .set_title(title)
+            .set_text(prompt)
+            .confirm()
+            .show()
+            .unwrap_or(false)
     }
 }
 
 /// Open a native OS directory picker dialog. Returns the selected path or
-/// `None` if the user cancelled. No extra crate dependency — shells out to
-/// the platform's built-in dialog tool.
+/// `None` if the user cancelled. Backported from public repo (commit
+/// 0c592ab): replaces the per-platform shell-out (osascript / zenity /
+/// PowerShell `FolderBrowserDialog`) with the `rfd` crate, which calls
+/// the same OS APIs natively. Eliminates dependence on `osascript` /
+/// `zenity` being installed and PowerShell quote-escaping bugs.
 fn pick_directory_native(start_dir: &str) -> Option<String> {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
-        // Returns Option<PathBuf>
-        let optionpathbuf = FileDialog::new()
+        FileDialog::new()
             .set_title("Select working directory")
             .set_directory(start_dir)
-            .pick_folder(); 
-        
-        // Option<PathBuf> to Option<String>
-        if let Some(pathbuf) = optionpathbuf {
-            Some(pathbuf.to_string_lossy().into_owned())
-        } else {
-            None
-        }
+            .pick_folder()
+            .map(|p| p.to_string_lossy().into_owned())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -633,6 +671,11 @@ fn build_session_list(store: &Option<SessionStore>) -> String {
             })
         })
         .collect();
+    // `current_id` is omitted here — this path (config_poll, session_load)
+    // runs on the main thread and doesn't own the worker's current-session
+    // state. Frontend keeps the last known `current_id` when the field is
+    // absent; the worker's own SessionListRefresh events provide the
+    // authoritative highlight.
     serde_json::json!({"type": "sessions_list", "sessions": sessions}).to_string()
 }
 
@@ -705,7 +748,7 @@ fn instructions_path(scope: &str) -> Option<std::path::PathBuf> {
 
 /// Build the `kms_update` IPC payload: every discoverable KMS tagged with
 /// whether it's currently attached to this project.
-fn build_kms_update_payload() -> serde_json::Value {
+pub(crate) fn build_kms_update_payload() -> serde_json::Value {
     let active: std::collections::HashSet<String> = crate::config::ProjectConfig::load()
         .and_then(|c| c.kms.map(|k| k.active))
         .unwrap_or_default()
@@ -758,10 +801,71 @@ pub fn run_gui() {
     // worker owns one Agent + Session + AppConfig and broadcasts every
     // ViewEvent to subscribers; the event translator below fans those
     // out as chat-shaped and terminal-shaped frontend dispatches.
-    let shared = Arc::new(crate::shared_session::spawn());
+    //
+    // GuiApprover bridges the Agent's async `approve()` call to the
+    // frontend: requests go out on `approval_rx` → dispatched as
+    // `approval_request` JSON; responses come back via the
+    // `approval_response` IPC and are pushed into the approver's
+    // internal oneshot responders.
+    let (approver, mut approval_rx) = crate::permissions::GuiApprover::new();
+    let approver_for_ipc = approver.clone();
+    let shared = Arc::new(crate::shared_session::spawn_with_approver(approver.clone()));
     spawn_event_translator(&shared, proxy.clone());
     let shared_for_ipc = shared.clone();
     let shared_for_events = shared.clone();
+
+    // Forwarder: approval requests → frontend dispatches. Spawned on a
+    // dedicated tokio runtime thread so we can `await` the mpsc without
+    // blocking the main event loop.
+    let proxy_for_approval = proxy.clone();
+    let approver_for_redispatch = approver.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("approval forwarder runtime");
+        rt.block_on(async move {
+            let proxy_inner = proxy_for_approval.clone();
+            let approver_inner = approver_for_redispatch.clone();
+            // Periodic redispatch: the initial `evaluate_script` can
+            // fire before the webview finishes its first React mount,
+            // at which point `window.__thclaws_dispatch` is undefined
+            // and the call silently drops. Re-sending every second
+            // until the user responds (tracked by id on the backend)
+            // is a cheap race-proof backstop.
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    let pending = approver_inner.unresolved_requests();
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    for req in pending {
+                        let payload = serde_json::json!({
+                            "type": "approval_request",
+                            "id": req.id,
+                            "tool_name": req.tool_name,
+                            "input": req.input,
+                            "summary": req.summary,
+                        });
+                        let _ = proxy_inner
+                            .send_event(UserEvent::Dispatch(payload.to_string()));
+                    }
+                }
+            });
+            while let Some(req) = approval_rx.recv().await {
+                let payload = serde_json::json!({
+                    "type": "approval_request",
+                    "id": req.id,
+                    "tool_name": req.tool_name,
+                    "input": req.input,
+                    "summary": req.summary,
+                });
+                let _ = proxy_for_approval
+                    .send_event(UserEvent::Dispatch(payload.to_string()));
+            }
+        });
+    });
 
     // Enable devtools when the env opt-in is set — lets users diagnose
     // a blank/black screen (Inspect → Console) without us shipping a
@@ -778,7 +882,62 @@ pub fn run_gui() {
 
     let webview = WebViewBuilder::new()
         .with_url(start_url)
-        .with_custom_protocol("thclaws".into(), |_webview_id, _request| {
+        .with_custom_protocol("thclaws".into(), |_webview_id, request| {
+            // File-asset route: serves on-disk files so previewed HTML
+            // can load its sibling CSS/JS with relative URLs. Example:
+            // `thclaws://localhost/file-asset/Users/jimmy/site/index.html`
+            // → reads `/Users/jimmy/site/index.html`. Every request is
+            // validated through the sandbox before hitting disk.
+            let req_path = request.uri().path();
+            if let Some(rest) = req_path.strip_prefix("/file-asset/") {
+                let decoded = urlencoding::decode(rest)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| rest.to_string());
+                let abs = format!("/{decoded}");
+                match crate::sandbox::Sandbox::check(&abs) {
+                    Ok(resolved) => match std::fs::read(&resolved) {
+                        Ok(bytes) => {
+                            let ext = resolved.extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            let mime = match ext.as_str() {
+                                "html" | "htm" => "text/html; charset=utf-8",
+                                "css" => "text/css; charset=utf-8",
+                                "js" | "mjs" => "application/javascript; charset=utf-8",
+                                "json" => "application/json; charset=utf-8",
+                                "svg" => "image/svg+xml",
+                                "png" => "image/png",
+                                "jpg" | "jpeg" => "image/jpeg",
+                                "gif" => "image/gif",
+                                "webp" => "image/webp",
+                                "ico" => "image/x-icon",
+                                "woff" => "font/woff",
+                                "woff2" => "font/woff2",
+                                "ttf" => "font/ttf",
+                                "otf" => "font/otf",
+                                _ => "application/octet-stream",
+                            };
+                            return Response::builder()
+                                .header("Content-Type", mime)
+                                .body(Cow::Owned(bytes))
+                                .expect("build file-asset response");
+                        }
+                        Err(_) => {
+                            return Response::builder()
+                                .status(404)
+                                .body(Cow::Borrowed(&b"not found"[..]))
+                                .expect("build 404");
+                        }
+                    },
+                    Err(_) => {
+                        return Response::builder()
+                            .status(403)
+                            .body(Cow::Borrowed(&b"forbidden"[..]))
+                            .expect("build 403");
+                    }
+                }
+            }
             Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
                 .body(Cow::Borrowed(FRONTEND_HTML.as_bytes()))
@@ -866,6 +1025,18 @@ pub fn run_gui() {
                             let _ = std::env::set_current_dir(p);
                             let _ = crate::sandbox::Sandbox::init();
                             save_recent_dir(path);
+                            // Tell the running worker to reload project
+                            // settings from the new cwd and swap its model
+                            // accordingly — without this, the session keeps
+                            // whatever model was loaded at startup, even
+                            // when the new project's settings.json says
+                            // something different. Project settings must
+                            // win — that's the contract.
+                            // Tell the worker to reload settings + swap
+                            // model from the new project's settings.json.
+                            let _ = shared_for_ipc
+                                .input_tx
+                                .send(ShellInput::ChangeCwd(p.to_path_buf()));
                             let payload = serde_json::json!({
                                 "type": "cwd_changed",
                                 "path": path,
@@ -924,6 +1095,29 @@ pub fn run_gui() {
                     // explicit cancel action from Chat) — request the
                     // current turn stop at its next streaming event.
                     shared_for_ipc.request_cancel();
+                }
+                "frontend_ready" => {
+                    // The frontend calls this once it's past the startup
+                    // modals (working-directory + secrets-backend pickers),
+                    // which releases deferred startup work like MCP spawn
+                    // approval. Idempotent — safe to call on every mount.
+                    shared_for_ipc.ready_gate.signal();
+                }
+                "approval_response" => {
+                    // Frontend approval modal resolved. Parse out the
+                    // request id + decision and hand them to the
+                    // GuiApprover, which unblocks the waiting agent call.
+                    let id = msg.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let decision_str = msg
+                        .get("decision")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("deny");
+                    let decision = match decision_str {
+                        "allow" => crate::permissions::ApprovalDecision::Allow,
+                        "allow_for_session" => crate::permissions::ApprovalDecision::AllowForSession,
+                        _ => crate::permissions::ApprovalDecision::Deny,
+                    };
+                    approver_for_ipc.resolve(id, decision);
                 }
                 "team_enabled_get" => {
                     let enabled = crate::config::ProjectConfig::load()
@@ -1510,6 +1704,8 @@ pub fn run_gui() {
                     ));
                 }
                 "file_list" => {
+                    // ospath() converts JSON-source `/` paths to `\` on
+                    // Windows so Sandbox::check accepts them.
                     let raw_path = ospath(msg.get("path").and_then(|v| v.as_str()).unwrap_or("."));
                     let resolved = crate::sandbox::Sandbox::check(&raw_path)
                         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
@@ -1540,8 +1736,9 @@ pub fn run_gui() {
                     }
                 }
                 "file_read" => {
+                    // ospath() converts JSON-source `/` paths to `\` on
+                    // Windows so Sandbox::check accepts them.
                     let raw_path = ospath(msg.get("path").and_then(|v| v.as_str()).unwrap_or(""));
-                  
                     // `mode` is optional. "preview" (default) renders .md
                     // to themed HTML; "source" returns the raw text so the
                     // frontend can hand it to a CodeMirror / TipTap editor.
@@ -1693,6 +1890,32 @@ pub fn run_gui() {
                     });
                     let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(payload.to_string()));
                     // Broadcast the refreshed list so the sidebar picks up the new title.
+                    if ok {
+                        let store = SessionStore::default_path().map(SessionStore::new);
+                        let list = build_session_list(&store);
+                        let _ = proxy_for_ipc.send_event(UserEvent::SessionListRefresh(list));
+                    }
+                }
+                "session_delete" => {
+                    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let (ok, error) = if id.is_empty() {
+                        (false, "id required".to_string())
+                    } else {
+                        match SessionStore::default_path().map(SessionStore::new) {
+                            Some(store) => match store.delete(id) {
+                                Ok(()) => (true, String::new()),
+                                Err(e) => (false, e.to_string()),
+                            },
+                            None => (false, "no session store".to_string()),
+                        }
+                    };
+                    let payload = serde_json::json!({
+                        "type": "session_delete_result",
+                        "id": id,
+                        "ok": ok,
+                        "error": error,
+                    });
+                    let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(payload.to_string()));
                     if ok {
                         let store = SessionStore::default_path().map(SessionStore::new);
                         let list = build_session_list(&store);

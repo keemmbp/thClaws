@@ -15,6 +15,7 @@
 use crate::repl::{default_model_for_provider, parse_slash, render_help, SlashCommand};
 use crate::session::Session;
 use crate::shared_session::{build_session_list, save_history, DisplayMessage, ViewEvent, WorkerState};
+use crate::util::{format_bytes, format_tokens, progress_bar};
 use tokio::sync::broadcast;
 
 /// Entry point — dispatch a single slash line against the shared
@@ -46,15 +47,108 @@ pub async fn dispatch(
         SlashCommand::Context => {
             let history = state.agent.history_snapshot();
             let blocks: usize = history.iter().map(|m| m.content.len()).sum();
-            emit(
-                events_tx,
-                format!(
-                    "context: {} message(s), {} content block(s), system prompt {} chars",
-                    history.len(),
-                    blocks,
-                    state.system_prompt.len(),
-                ),
+            // Token estimate + percentage of the model's real context
+            // window. Same estimator the auto-compact trigger uses, so
+            // the number here and the 80% threshold line up.
+            let history_tokens = crate::compaction::estimate_messages_tokens(&history);
+            // System prompt ~1 token per 4 chars (same rule-of-thumb
+            // the rest of the estimator uses).
+            let system_tokens = state.system_prompt.len() / 4;
+            let total_tokens = history_tokens + system_tokens;
+            let window = state.agent.budget_tokens.max(1);
+            let pct = (total_tokens as f64 / window as f64) * 100.0;
+            // Per-contributor size breakdown. Lets the user spot which
+            // file is bloating the system prompt — e.g. an AGENTS.md
+            // that ballooned past the ch08 soft budget or a
+            // `project_context.md` that grew over weeks of auto-memory
+            // writes. Each budget check appends "⚠" when exceeded.
+            const BUDGET_CLAUDE_MD: u64 = 1024; // 1 KB per file
+            const BUDGET_MEMORY_INDEX: u64 = 512; // 500 B (manual)
+            const BUDGET_MEMORY_ENTRY: u64 = 1024; // 1 KB per topic
+            let claude_files = crate::context::scan_claude_md_sizes(&state.cwd);
+            let claude_total: u64 = claude_files.iter().map(|(_, n)| *n).sum();
+            let claude_over: Vec<String> = claude_files
+                .iter()
+                .filter(|(_, n)| *n > BUDGET_CLAUDE_MD)
+                .map(|(p, n)| {
+                    format!(
+                        "{} ({})",
+                        p.file_name().map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string()),
+                        format_bytes(*n),
+                    )
+                })
+                .collect();
+            let (mem_index_bytes, mem_entries) = crate::memory::MemoryStore::default_path()
+                .map(crate::memory::MemoryStore::new)
+                .map(|s| crate::memory::memory_sizes(&s))
+                .unwrap_or((0, Vec::new()));
+            let mem_entries_total: u64 = mem_entries.iter().map(|(_, n)| *n).sum();
+            let mem_entries_over: Vec<String> = mem_entries
+                .iter()
+                .filter(|(_, n)| *n > BUDGET_MEMORY_ENTRY)
+                .map(|(name, n)| format!("{} ({})", name, format_bytes(*n)))
+                .collect();
+
+            let mut out = format!(
+                "context: {} message(s), {} content block(s), system prompt {} chars\n\
+                 model: {} · window: {} tokens · used: ~{} tokens\n\
+                 {} {:.1}%",
+                history.len(),
+                blocks,
+                state.system_prompt.len(),
+                state.config.model,
+                format_tokens(window),
+                format_tokens(total_tokens),
+                progress_bar(pct, 24),
+                pct,
             );
+            if !claude_files.is_empty() || mem_index_bytes > 0 || !mem_entries.is_empty() {
+                out.push_str("\nsystem-prompt breakdown:");
+                if !claude_files.is_empty() {
+                    out.push_str(&format!(
+                        "\n  CLAUDE.md / AGENTS.md  {}  ({} file{})",
+                        format_bytes(claude_total),
+                        claude_files.len(),
+                        if claude_files.len() == 1 { "" } else { "s" },
+                    ));
+                    if !claude_over.is_empty() {
+                        out.push_str(&format!(
+                            "  ⚠ over {} cap: {}",
+                            format_bytes(BUDGET_CLAUDE_MD),
+                            claude_over.join(", "),
+                        ));
+                    }
+                }
+                if mem_index_bytes > 0 {
+                    out.push_str(&format!(
+                        "\n  MEMORY.md              {}",
+                        format_bytes(mem_index_bytes),
+                    ));
+                    if mem_index_bytes > BUDGET_MEMORY_INDEX {
+                        out.push_str(&format!(
+                            "  ⚠ over {} cap",
+                            format_bytes(BUDGET_MEMORY_INDEX),
+                        ));
+                    }
+                }
+                if !mem_entries.is_empty() {
+                    out.push_str(&format!(
+                        "\n  memory entries         {}  ({} file{})",
+                        format_bytes(mem_entries_total),
+                        mem_entries.len(),
+                        if mem_entries.len() == 1 { "" } else { "s" },
+                    ));
+                    if !mem_entries_over.is_empty() {
+                        out.push_str(&format!(
+                            "  ⚠ over {} cap: {}",
+                            format_bytes(BUDGET_MEMORY_ENTRY),
+                            mem_entries_over.join(", "),
+                        ));
+                    }
+                }
+            }
+            emit(events_tx, out);
         }
         SlashCommand::History => {
             let history = state.agent.history_snapshot();
@@ -97,27 +191,134 @@ pub async fn dispatch(
             }
             emit(events_tx, out);
         }
-        SlashCommand::Models => match crate::repl::build_provider(&state.config) {
-            Ok(p) => match p.list_models().await {
-                Ok(models) if models.is_empty() => {
-                    emit(events_tx, "(no models returned)".into())
+        SlashCommand::ModelsRefresh => {
+            emit(events_tx, "refreshing model catalogue…".into());
+            match crate::model_catalogue::refresh_from_remote().await {
+                Ok(out) => emit(
+                    events_tx,
+                    format!(
+                        "catalogue refreshed: {} models (source: {})",
+                        out.model_count,
+                        if out.source.is_empty() {
+                            "unspecified".into()
+                        } else {
+                            out.source
+                        }
+                    ),
+                ),
+                Err(e) => emit(
+                    events_tx,
+                    format!(
+                        "catalogue refresh failed: {e} (keeping existing {})",
+                        if crate::model_catalogue::cache_path()
+                            .map(|p| p.exists())
+                            .unwrap_or(false)
+                        {
+                            "cache"
+                        } else {
+                            "embedded baseline"
+                        }
+                    ),
+                ),
+            }
+        }
+        SlashCommand::Models => {
+            fn format_tokens(n: u32) -> String {
+                if n >= 1_000_000 {
+                    let m = n as f64 / 1_000_000.0;
+                    if (m - m.round()).abs() < 0.05 {
+                        format!("{:.0}M", m)
+                    } else {
+                        format!("{:.1}M", m)
+                    }
+                } else if n >= 1_000 {
+                    format!("{}K", n / 1_000)
+                } else {
+                    n.to_string()
                 }
-                Ok(models) => {
-                    let mut out = String::from("Models:\n");
-                    for m in models {
-                        match m.display_name {
-                            Some(dn) => {
-                                out.push_str(&format!("  {} — {}\n", m.id, dn))
+            }
+            let kind = match state.config.detect_provider_kind() {
+                Ok(k) => k,
+                Err(e) => {
+                    emit(events_tx, format!("provider error: {e}"));
+                    return;
+                }
+            };
+            let cat = crate::model_catalogue::EffectiveCatalogue::load();
+            let provider_name = crate::model_catalogue::provider_kind_name(kind);
+
+            // Collect ids from the catalogue (baseline ∪ user cache, with
+            // cache winning on metadata). This is the list we render for
+            // every non-Ollama provider.
+            let mut rows = cat.list_models_for_provider(provider_name);
+
+            // Ollama is per-machine, so the catalogue alone can't know what
+            // the user has pulled — hit `/api/tags` too and union any new
+            // ids (without context until `/model <id>` auto-scans them).
+            let is_ollama = matches!(
+                kind,
+                crate::providers::ProviderKind::Ollama
+                    | crate::providers::ProviderKind::OllamaAnthropic,
+            );
+            let mut live_note: Option<String> = None;
+            if is_ollama {
+                if let Ok(p) = crate::repl::build_provider(&state.config) {
+                    match p.list_models().await {
+                        Ok(live) => {
+                            let have: std::collections::HashSet<String> =
+                                rows.iter().map(|(id, _)| id.clone()).collect();
+                            for m in live {
+                                if !have.contains(&m.id) {
+                                    rows.push((
+                                        m.id,
+                                        crate::model_catalogue::ModelEntry {
+                                            context: None,
+                                            max_output: None,
+                                            source: None,
+                                            verified_at: None,
+                                        },
+                                    ));
+                                }
                             }
-                            None => out.push_str(&format!("  {}\n", m.id)),
+                            rows.sort_by(|a, b| a.0.cmp(&b.0));
+                        }
+                        Err(e) => {
+                            live_note = Some(format!(
+                                "(could not reach Ollama /api/tags: {e}; showing catalogue only)"
+                            ));
                         }
                     }
-                    emit(events_tx, out);
                 }
-                Err(e) => emit(events_tx, format!("list models failed: {e}")),
-            },
-            Err(e) => emit(events_tx, format!("provider error: {e}")),
-        },
+            }
+
+            if rows.is_empty() {
+                emit(
+                    events_tx,
+                    format!(
+                        "no models catalogued for '{provider_name}'. Run /models refresh."
+                    ),
+                );
+                return;
+            }
+
+            let mut out = format!(
+                "models — {provider_name} ({} entries, from catalogue{})\n",
+                rows.len(),
+                if is_ollama { " + /api/tags" } else { "" }
+            );
+            for (id, entry) in &rows {
+                let ctx = entry
+                    .context
+                    .map(format_tokens)
+                    .unwrap_or_else(|| "—".to_string());
+                out.push_str(&format!("  {:<40} {:>6}\n", id, ctx));
+            }
+            if let Some(note) = live_note {
+                out.push_str(&format!("\n{note}\n"));
+            }
+            out.push_str("\ntype /models refresh to re-seed from openrouter/vendor lists\n");
+            emit(events_tx, out);
+        }
         SlashCommand::Model(arg) => {
             let arg = arg.trim();
             if arg.is_empty() {
@@ -273,16 +474,36 @@ pub async fn dispatch(
                     ),
                 );
             } else {
-                match mode.as_str() {
+                let persisted = match mode.as_str() {
                     "auto" | "yolo" => {
                         state.agent.permission_mode = crate::permissions::PermissionMode::Auto;
-                        emit(events_tx, "permissions → auto (no prompts)".into());
+                        state.config.permissions = "auto".into();
+                        Some("auto")
                     }
                     "ask" | "default" => {
                         state.agent.permission_mode = crate::permissions::PermissionMode::Ask;
-                        emit(events_tx, "permissions → ask".into());
+                        state.config.permissions = "ask".into();
+                        Some("ask")
                     }
-                    _ => emit(events_tx, "usage: /permissions auto|ask".into()),
+                    _ => {
+                        emit(events_tx, "usage: /permissions auto|ask".into());
+                        None
+                    }
+                };
+                if let Some(m) = persisted {
+                    // Persist so a restart lands on the same policy.
+                    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
+                    project.set_permissions_mode(m);
+                    let save_note = match project.save() {
+                        Ok(()) => "saved to .thclaws/settings.json",
+                        Err(_) => "warning: could not save to .thclaws/settings.json",
+                    };
+                    let label = if m == "auto" {
+                        "permissions → auto (no prompts)"
+                    } else {
+                        "permissions → ask"
+                    };
+                    emit(events_tx, format!("{label} ({save_note})"));
                 }
             }
         }
@@ -317,9 +538,96 @@ pub async fn dispatch(
             let history = state.agent.history_snapshot();
             let compacted = crate::compaction::compact(&history, state.agent.budget_tokens / 2);
             state.agent.set_history(compacted.clone());
+            // Persist a checkpoint so the next `/load` starts from the
+            // compacted view instead of replaying the full history.
+            let persist_note = match (&state.session_store, compacted.len() < history.len()) {
+                (Some(store), true) => {
+                    let path = store.path_for(&state.session.id);
+                    match state.session.append_compaction_to(&path, &compacted) {
+                        Ok(()) => " (checkpoint saved)".to_string(),
+                        Err(e) => format!(" (checkpoint save failed: {e})"),
+                    }
+                }
+                _ => String::new(),
+            };
             emit(
                 events_tx,
-                format!("compacted: {} → {} messages", history.len(), compacted.len()),
+                format!(
+                    "compacted: {} → {} messages{persist_note}",
+                    history.len(),
+                    compacted.len()
+                ),
+            );
+        }
+        SlashCommand::Fork => {
+            // Flush the current session to disk so the archive reflects
+            // everything up to this moment, then build an LLM-summary
+            // of the history and seed a fresh session with it so the
+            // next turn starts in a clean file with compact context.
+            save_history(&state.agent, &mut state.session, &state.session_store);
+            let history = state.agent.history_snapshot();
+            if history.is_empty() {
+                emit(events_tx, "/fork: nothing to summarize — history is empty".into());
+                return;
+            }
+            let provider = match crate::repl::build_provider(&state.config) {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(events_tx, format!("/fork: can't build provider: {e}"));
+                    return;
+                }
+            };
+            // Aim for roughly half of budget_tokens so the new session
+            // has room to grow before the next auto-compact kicks in.
+            let target = state.agent.budget_tokens / 2;
+            let summary_history = crate::compaction::compact_with_summary(
+                &history,
+                target,
+                provider.as_ref(),
+                &state.config.model,
+            )
+            .await;
+            let fallback_note = if summary_history.len() < history.len()
+                && summary_history
+                    .first()
+                    .map(|m| match m.content.first() {
+                        Some(crate::types::ContentBlock::Text { text }) => {
+                            text.starts_with("[Conversation summary")
+                        }
+                        _ => false,
+                    })
+                    .unwrap_or(false)
+            {
+                ""
+            } else {
+                " (summary unavailable — used drop-oldest)"
+            };
+            // New session, seeded with the summary + recent turns.
+            let old_id = state.session.id.clone();
+            state.session =
+                crate::session::Session::new(&state.config.model, state.session.cwd.clone());
+            state.warned_file_size = false;
+            state.agent.clear_history();
+            state.agent.set_history(summary_history.clone());
+            state.session.messages = summary_history.clone();
+            // Persist the new session with its seeded history.
+            if let Some(store) = &state.session_store {
+                let _ = store.save(&mut state.session);
+            }
+            let display =
+                crate::shared_session::DisplayMessage::from_messages(&summary_history);
+            let _ = events_tx.send(crate::shared_session::ViewEvent::HistoryReplaced(display));
+            let _ = events_tx.send(crate::shared_session::ViewEvent::SessionListRefresh(
+                build_session_list(&state.session_store, &state.session.id),
+            ));
+            emit(
+                events_tx,
+                format!(
+                    "/fork: forked {old_id} → {} ({} → {} messages){fallback_note}",
+                    state.session.id,
+                    history.len(),
+                    summary_history.len()
+                ),
             );
         }
 
@@ -443,15 +751,18 @@ pub async fn dispatch(
                 crate::kms::KmsScope::User
             };
             match crate::kms::create(&name, scope) {
-                Ok(k) => emit(
-                    events_tx,
-                    format!(
-                        "created KMS '{}' ({}) → {}",
-                        k.name,
-                        k.scope.as_str(),
-                        k.root.display()
-                    ),
-                ),
+                Ok(k) => {
+                    emit(
+                        events_tx,
+                        format!(
+                            "created KMS '{}' ({}) → {}",
+                            k.name,
+                            k.scope.as_str(),
+                            k.root.display()
+                        ),
+                    );
+                    broadcast_kms_update(events_tx);
+                }
                 Err(e) => emit(events_tx, format!("create failed: {e}")),
             }
         }
@@ -489,6 +800,7 @@ pub async fn dispatch(
                     events_tx,
                     format!("KMS '{name}' attached (tools registered; available this turn)"),
                 );
+                broadcast_kms_update(events_tx);
             }
         }
         SlashCommand::KmsOff(name) => {
@@ -518,6 +830,7 @@ pub async fn dispatch(
                     events_tx,
                     format!("KMS '{name}' detached (system prompt updated)"),
                 );
+                broadcast_kms_update(events_tx);
             }
         }
         SlashCommand::KmsShow(name) => match crate::kms::resolve(&name) {
@@ -536,6 +849,38 @@ pub async fn dispatch(
             }
             None => emit(events_tx, format!("no KMS named '{name}'")),
         },
+        SlashCommand::KmsIngest { name, file, alias, force } => {
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(
+                    events_tx,
+                    format!("no KMS named '{name}' (try /kms list or /kms new {name})"),
+                );
+                return;
+            };
+            let source = std::path::PathBuf::from(&file);
+            let source = if source.is_absolute() {
+                source
+            } else {
+                state.cwd.join(&source)
+            };
+            match crate::kms::ingest(&k, &source, alias.as_deref(), force) {
+                Ok(r) => {
+                    let verb = if r.overwrote { "replaced" } else { "ingested" };
+                    emit(
+                        events_tx,
+                        format!(
+                            "{verb} → {} — {}",
+                            r.target.display(),
+                            r.summary,
+                        ),
+                    );
+                    // No kms_update broadcast — ingest doesn't change
+                    // the list of KMSes or their active state. The
+                    // index.md change is picked up on next /kms show.
+                }
+                Err(e) => emit(events_tx, format!("ingest failed: {e}")),
+            }
+        }
 
         // ─── MCP servers ────────────────────────────────────────────
         SlashCommand::Mcp => {
@@ -572,7 +917,12 @@ pub async fn dispatch(
                 }
             };
             // 2. Spawn the client + list tools + register them.
-            match crate::mcp::McpClient::spawn(cfg.clone()).await {
+            match crate::mcp::McpClient::spawn_with_approver(
+                cfg.clone(),
+                Some(state.approver.clone()),
+            )
+            .await
+            {
                 Ok(client) => match client.list_tools().await {
                     Ok(tool_infos) => {
                         let names: Vec<String> =
@@ -822,19 +1172,39 @@ async fn switch_model(
         }
     }
 
-    // Flush prior session before swapping.
+    // Intra-family swap (e.g. sonnet → opus, both Anthropic) keeps the
+    // same message/tool-call schema on the wire, so the existing
+    // conversation replays cleanly against the new model. Cross-family
+    // swaps (Anthropic → OpenAI → Gemini) change the wire shape and
+    // would either hard-error or silently corrupt context — fork to a
+    // fresh session instead.
+    let old_kind = crate::providers::ProviderKind::detect(&state.config.model);
+    let new_kind = crate::providers::ProviderKind::detect(&resolved);
+    let same_family = old_kind.is_some() && old_kind == new_kind;
+
+    // Flush prior session before swapping. We always want the on-disk
+    // copy up-to-date regardless of which branch we take next.
     save_history(&state.agent, &mut state.session, &state.session_store);
 
     state.config = candidate;
-    match state.rebuild_agent(false) {
-        Ok(()) => {}
-        Err(e) => {
+    if same_family {
+        // Preserve history across the model swap. `rebuild_agent(true)`
+        // carries the existing message list into the fresh Agent; the
+        // session itself keeps its id and accumulated messages, we just
+        // update the `model` label so the header reflects the new model.
+        if let Err(e) = state.rebuild_agent(true) {
             emit(events_tx, format!("rebuild failed: {e}"));
             return;
         }
+        state.session.model = state.config.model.clone();
+    } else {
+        if let Err(e) = state.rebuild_agent(false) {
+            emit(events_tx, format!("rebuild failed: {e}"));
+            return;
+        }
+        state.agent.clear_history();
+        state.session = Session::new(&state.config.model, state.session.cwd.clone());
     }
-    state.agent.clear_history();
-    state.session = Session::new(&state.config.model, state.session.cwd.clone());
 
     // Persist the model choice to project settings so a restart lands
     // on the same provider/model.
@@ -843,17 +1213,110 @@ async fn switch_model(
     let _ = project.save();
 
     let provider = state.config.detect_provider().unwrap_or("unknown");
+    let session_note = if same_family {
+        "conversation preserved".to_string()
+    } else {
+        format!("new session {}", state.session.id)
+    };
     emit(
         events_tx,
         format!(
-            "model → {} (provider: {provider}; saved to .thclaws/settings.json; new session {})",
-            state.config.model, state.session.id
+            "model → {} (provider: {provider}; saved to .thclaws/settings.json; {session_note})",
+            state.config.model
         ),
     );
-    let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
+    // Catalogue hint: if we don't have an exact context-window entry
+    // for this model, try to discover it at the source.
+    // - Ollama models: hit `POST /api/show` for the chosen context
+    //   (prefers `num_ctx` over native `context_length`) and write
+    //   the result into the user cache so it sticks.
+    // - Everyone else: emit the "run /models refresh" nudge.
+    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+    let (ctx, known) =
+        crate::model_catalogue::effective_context_window_with(&cat, &state.config.model);
+    if !known {
+        let is_ollama = matches!(
+            new_kind,
+            Some(crate::providers::ProviderKind::Ollama)
+                | Some(crate::providers::ProviderKind::OllamaAnthropic)
+        );
+        let mut resolved_via_ollama = false;
+        if is_ollama {
+            let base = std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| {
+                crate::providers::ollama::DEFAULT_BASE_URL.to_string()
+            });
+            let ollama = crate::providers::ollama::OllamaProvider::new().with_base_url(base.clone());
+            let model_id = state.config.model.clone();
+            match ollama.show(&model_id).await {
+                Ok((n, which)) => {
+                    let provider_key = match new_kind {
+                        Some(crate::providers::ProviderKind::OllamaAnthropic) => "ollama-anthropic",
+                        _ => "ollama",
+                    };
+                    let entry = crate::model_catalogue::ModelEntry {
+                        context: Some(n),
+                        max_output: None,
+                        source: Some(format!("ollama://{base}/api/show ({which})")),
+                        verified_at: Some(crate::model_catalogue::today_iso()),
+                    };
+                    match crate::model_catalogue::upsert_cache_entry(
+                        provider_key,
+                        &model_id,
+                        entry,
+                    ) {
+                        Ok(()) => {
+                            emit(
+                                events_tx,
+                                format!(
+                                    "auto-scanned '{model_id}' via Ollama /api/show → {n} tokens ({which}); cached for next time"
+                                ),
+                            );
+                            resolved_via_ollama = true;
+                        }
+                        Err(e) => emit(
+                            events_tx,
+                            format!("scanned Ollama context ({n} tokens) but cache write failed: {e}"),
+                        ),
+                    }
+                }
+                Err(e) => emit(
+                    events_tx,
+                    format!("could not scan Ollama context for '{model_id}': {e}"),
+                ),
+            }
+        }
+        if !resolved_via_ollama {
+            emit(
+                events_tx,
+                format!(
+                    "⚠ no catalogue entry for '{}' — using {} ({} tokens). Run /models refresh to pick up newer entries.",
+                    state.config.model,
+                    provider,
+                    ctx
+                ),
+            );
+        }
+    }
+    // Only reset the view's history when we actually forked. On a same-
+    // family swap the bubbles / terminal replay stays as-is.
+    if !same_family {
+        let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
+    }
     let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
         &state.session_store,
+        &state.session.id,
     )));
+    // Push the sidebar's Provider/Model section immediately so it
+    // doesn't lag behind until the 5 s config_poll fires.
+    let payload = serde_json::json!({
+        "type": "provider_update",
+        "provider": provider,
+        "model": state.config.model,
+        "provider_ready": true,
+    });
+    let _ = events_tx.send(crate::shared_session::ViewEvent::ProviderUpdate(
+        payload.to_string(),
+    ));
 }
 
 fn doctor_report(state: &WorkerState) -> String {
@@ -909,4 +1372,12 @@ fn doctor_report(state: &WorkerState) -> String {
 
 fn emit(events_tx: &broadcast::Sender<ViewEvent>, text: String) {
     let _ = events_tx.send(ViewEvent::SlashOutput(text));
+}
+
+/// Push the latest KMS list to the sidebar after a /kms mutation so
+/// the sidebar's list, active-marker, and scope tags reflect the new
+/// state without waiting for a full session_update tick.
+fn broadcast_kms_update(events_tx: &broadcast::Sender<ViewEvent>) {
+    let payload = crate::gui::build_kms_update_payload();
+    let _ = events_tx.send(ViewEvent::KmsUpdate(payload.to_string()));
 }

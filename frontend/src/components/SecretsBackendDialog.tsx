@@ -40,12 +40,17 @@ export function SecretsBackendDialog({
     <div
       className="fixed inset-0 flex items-center justify-center z-50"
       style={{ background: "var(--modal-backdrop)" }}
-      onClick={onCancel}
+      // Close on backdrop mousedown only when the click started on
+      // the backdrop itself — prevents drag-to-select from dismissing
+      // the dialog when the mouseup lands outside.
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel?.();
+      }}
     >
       <div
         className="rounded-lg shadow-2xl p-6 max-w-lg w-full mx-4"
         style={{ background: "var(--bg-secondary)", border: "1px solid var(--border)" }}
-        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>

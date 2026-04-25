@@ -38,6 +38,10 @@ pub enum SlashCommand {
     History,
     Model(String),
     Models,
+    /// Download the model catalogue from the thclaws.ai endpoint and
+    /// update the local cache. Used by the `/models refresh` UI path
+    /// and by the daily auto-refresh background task.
+    ModelsRefresh,
     Provider(String),
     Providers,
     Config {
@@ -86,6 +90,11 @@ pub enum SlashCommand {
     Cwd,
     Thinking(String),
     Compact,
+    /// Save the current session, then start a fresh session seeded with
+    /// an LLM-summarized view of the prior history. Used when the
+    /// session's on-disk JSONL has grown past the working threshold
+    /// and continuing in-place would keep bloating the file.
+    Fork,
     Doctor,
     Skills,
     SkillInstall {
@@ -105,6 +114,12 @@ pub enum SlashCommand {
     KmsUse(String),
     KmsOff(String),
     KmsShow(String),
+    KmsIngest {
+        name: String,
+        file: String,
+        alias: Option<String>,
+        force: bool,
+    },
     Unknown(String),
 }
 
@@ -267,7 +282,11 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "clear" => SlashCommand::Clear,
         "history" => SlashCommand::History,
         "model" => SlashCommand::Model(args.to_string()),
-        "models" => SlashCommand::Models,
+        "models" => match args.trim() {
+            "refresh" => SlashCommand::ModelsRefresh,
+            "" => SlashCommand::Models,
+            other => SlashCommand::Unknown(format!("unknown /models subcommand: '{other}' (try /models or /models refresh)")),
+        },
         "provider" => SlashCommand::Provider(args.to_string()),
         "providers" => SlashCommand::Providers,
         "config" => match args.split_once('=') {
@@ -301,6 +320,7 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "cwd" | "pwd" => SlashCommand::Cwd,
         "thinking" => SlashCommand::Thinking(args.to_string()),
         "compact" => SlashCommand::Compact,
+        "fork" => SlashCommand::Fork,
         "doctor" | "diag" => SlashCommand::Doctor,
         "skills" => SlashCommand::Skills,
         "skill" => {
@@ -372,13 +392,18 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
     match sub {
         "" | "list" | "ls" => SlashCommand::Kms,
         "new" | "create" => {
-            let mut project = false;
+            // Project scope is the default — a KMS is typically tied
+            // to the code you're working on, so `./.thclaws/kms/<name>`
+            // follows the repo. `--user` opts out into the user-global
+            // `~/.config/thclaws/kms/<name>`. `--project` is accepted
+            // as a no-op alias so muscle memory from the old default
+            // doesn't break on upgrade.
+            let mut project = true;
             let mut parts: Vec<&str> = rest.split_whitespace().collect();
-            if let Some(i) = parts.iter().position(|p| *p == "--project") {
-                project = true;
-                parts.remove(i);
-            } else if let Some(i) = parts.iter().position(|p| *p == "--user") {
+            if let Some(i) = parts.iter().position(|p| *p == "--user") {
                 project = false;
+                parts.remove(i);
+            } else if let Some(i) = parts.iter().position(|p| *p == "--project") {
                 parts.remove(i);
             }
             match parts.as_slice() {
@@ -387,7 +412,7 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
                     project,
                 },
                 _ => SlashCommand::Unknown(
-                    "usage: /kms new [--project] <name>".into(),
+                    "usage: /kms new [--user] <name>".into(),
                 ),
             }
         }
@@ -412,8 +437,45 @@ fn parse_kms_subcommand(args: &str) -> SlashCommand {
                 SlashCommand::KmsShow(rest.to_string())
             }
         }
+        "ingest" | "add" => {
+            // Syntax: /kms ingest <kms-name> <file> [as <alias>] [--force]
+            //
+            // KMS name is always explicit — we don't want to "helpfully"
+            // pick an active KMS when the user has several attached and
+            // mean the one they think of.
+            let mut parts: Vec<&str> = rest.split_whitespace().collect();
+            let mut force = false;
+            if let Some(i) = parts.iter().position(|p| *p == "--force" || *p == "-f") {
+                force = true;
+                parts.remove(i);
+            }
+            // Pull optional `as <alias>` out before parsing positionals so
+            // the alias slot isn't sensitive to position.
+            let mut alias: Option<String> = None;
+            if let Some(i) = parts.iter().position(|p| *p == "as") {
+                if i + 1 < parts.len() {
+                    alias = Some(parts[i + 1].to_string());
+                    parts.drain(i..=i + 1);
+                } else {
+                    return SlashCommand::Unknown(
+                        "usage: /kms ingest <kms> <file> [as <alias>] [--force]".into(),
+                    );
+                }
+            }
+            match parts.as_slice() {
+                [name, file] => SlashCommand::KmsIngest {
+                    name: (*name).to_string(),
+                    file: (*file).to_string(),
+                    alias,
+                    force,
+                },
+                _ => SlashCommand::Unknown(
+                    "usage: /kms ingest <kms> <file> [as <alias>] [--force]".into(),
+                ),
+            }
+        }
         other => SlashCommand::Unknown(format!(
-            "unknown kms subcommand: '{other}' (try: /kms, /kms new …, /kms use …, /kms off …, /kms show …)"
+            "unknown kms subcommand: '{other}' (try: /kms, /kms new …, /kms use …, /kms off …, /kms show …, /kms ingest …)"
         )),
     }
 }
@@ -467,12 +529,16 @@ pub fn render_help() -> &'static str {
      \x20                 a .zip URL into ./.thclaws/skills/ (default) or\n  \
      \x20                 ~/.config/thclaws/skills/ (--user)\n  \
      /kms              List knowledge bases (* = active for this project)\n  \
-     /kms new [--project] NAME\n  \
-     \x20                 Create a new KMS under ~/.config/thclaws/kms/\n  \
-     \x20                 (default) or ./.thclaws/kms/ (--project)\n  \
+     /kms new [--user] NAME\n  \
+     \x20                 Create a new KMS under ./.thclaws/kms/\n  \
+     \x20                 (default) or ~/.config/thclaws/kms/ (--user)\n  \
      /kms use NAME     Attach a KMS to this project's chats\n  \
      /kms off NAME     Detach a KMS\n  \
-     /kms show NAME    Print the KMS index.md\n\n  \
+     /kms show NAME    Print the KMS index.md\n  \
+     /kms ingest KMS FILE [as ALIAS] [--force]\n  \
+     \x20                 Copy a working-dir file into KMS/pages/ and\n  \
+     \x20                 add it to the index. Allowed: .md .markdown\n  \
+     \x20                 .txt .rst .log .json\n\n  \
      ! <command>       Run a shell command directly (e.g. ! git status)"
 }
 
@@ -934,6 +1000,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         None
     };
 
+    // Mark this process as the team lead if applicable. BashTool consults
+    // this to hard-block destructive workspace ops (`git reset --hard`,
+    // `rm -rf`, `git worktree remove`) that have repeatedly cascade-killed
+    // teammate processes when an LLM lead tried to "clean up". Set as a
+    // static rather than env var so child teammate processes (which inherit
+    // env) don't accidentally pick up the lead flag.
+    crate::team::set_is_team_lead(team_enabled && team_agent_name.is_none());
+
     // Team agents: remove interactive tools — no human is watching.
     if team_agent_name.is_some() {
         tool_registry.remove("AskUserQuestion");
@@ -1191,6 +1265,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     };
     let v = crate::version::info();
     let dirty_tag = if v.git_dirty { "+dirty" } else { "" };
+    if team_agent_name.is_none() {
+        const BANNER: &str = include_str!("../../../banner.txt");
+        println!("\n{COLOR_CYAN}{BANNER}{COLOR_RESET}");
+        println!();
+    }
     println!(
         "{COLOR_BOLD}thClaws {}{COLOR_RESET} {COLOR_DIM}({}{}) — model: {} · permissions: {} · session: {}{COLOR_RESET}",
         v.version, v.git_sha, dirty_tag, config.model, perm_label, session.id
@@ -1261,6 +1340,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             String::new()
         };
 
+        let cwd_str = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
         // Inject team communication rules (matches Claude Code's TEAMMATE_SYSTEM_PROMPT_ADDENDUM).
         let team_rules = crate::prompts::render_named(
             "agent_team",
@@ -1268,6 +1352,8 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             &[
                 ("agent_name", agent_name),
                 ("team_members_info", &team_members_info),
+                ("cwd", &cwd_str),
+                ("project_root", &project_root),
                 ("worktree_rules", &worktree_rules),
             ],
         );
@@ -1924,6 +2010,18 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         config.model, session.id
                     );
                 }
+                SlashCommand::ModelsRefresh => {
+                    println!("{COLOR_DIM}refreshing model catalogue…{COLOR_RESET}");
+                    match crate::model_catalogue::refresh_from_remote().await {
+                        Ok(out) => println!(
+                            "{COLOR_DIM}catalogue refreshed: {} models (source: {}){COLOR_RESET}",
+                            out.model_count, out.source
+                        ),
+                        Err(e) => println!(
+                            "{COLOR_YELLOW}catalogue refresh failed: {e}{COLOR_RESET}"
+                        ),
+                    }
+                }
                 SlashCommand::Models => {
                     // Build a fresh provider from current config and query it.
                     match build_provider(&config) {
@@ -2138,7 +2236,106 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::Context => {
-                    println!("{COLOR_DIM}{system}{COLOR_RESET}");
+                    let history = agent.history_snapshot();
+                    let blocks: usize = history.iter().map(|m| m.content.len()).sum();
+                    let history_tokens = crate::compaction::estimate_messages_tokens(&history);
+                    let system_tokens = system.len() / 4;
+                    let total_tokens = history_tokens + system_tokens;
+                    let window = agent.budget_tokens.max(1);
+                    let pct = (total_tokens as f64 / window as f64) * 100.0;
+
+                    const BUDGET_CLAUDE_MD: u64 = 1024;
+                    const BUDGET_MEMORY_INDEX: u64 = 512;
+                    const BUDGET_MEMORY_ENTRY: u64 = 1024;
+                    let claude_files = crate::context::scan_claude_md_sizes(&cwd);
+                    let claude_total: u64 = claude_files.iter().map(|(_, n)| *n).sum();
+                    let claude_over: Vec<String> = claude_files
+                        .iter()
+                        .filter(|(_, n)| *n > BUDGET_CLAUDE_MD)
+                        .map(|(p, n)| {
+                            format!(
+                                "{} ({})",
+                                p.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| p.display().to_string()),
+                                crate::util::format_bytes(*n),
+                            )
+                        })
+                        .collect();
+                    let (mem_index_bytes, mem_entries) = crate::memory::MemoryStore::default_path()
+                        .map(crate::memory::MemoryStore::new)
+                        .map(|s| crate::memory::memory_sizes(&s))
+                        .unwrap_or((0, Vec::new()));
+                    let mem_entries_total: u64 = mem_entries.iter().map(|(_, n)| *n).sum();
+                    let mem_entries_over: Vec<String> = mem_entries
+                        .iter()
+                        .filter(|(_, n)| *n > BUDGET_MEMORY_ENTRY)
+                        .map(|(name, n)| format!("{} ({})", name, crate::util::format_bytes(*n)))
+                        .collect();
+
+                    println!(
+                        "{COLOR_DIM}context: {} message(s), {} content block(s), system prompt {} chars{COLOR_RESET}",
+                        history.len(),
+                        blocks,
+                        system.len()
+                    );
+                    println!(
+                        "{COLOR_DIM}model: {} · window: {} tokens · used: ~{} tokens{COLOR_RESET}",
+                        config.model,
+                        crate::util::format_tokens(window),
+                        crate::util::format_tokens(total_tokens),
+                    );
+                    println!(
+                        "{COLOR_DIM}{} {:.1}%{COLOR_RESET}",
+                        crate::util::progress_bar(pct, 24),
+                        pct,
+                    );
+                    if !claude_files.is_empty() || mem_index_bytes > 0 || !mem_entries.is_empty() {
+                        println!("{COLOR_DIM}system-prompt breakdown:{COLOR_RESET}");
+                        if !claude_files.is_empty() {
+                            let mut line = format!(
+                                "  CLAUDE.md / AGENTS.md  {}  ({} file{})",
+                                crate::util::format_bytes(claude_total),
+                                claude_files.len(),
+                                if claude_files.len() == 1 { "" } else { "s" },
+                            );
+                            if !claude_over.is_empty() {
+                                line.push_str(&format!(
+                                    "  ⚠ over {} cap: {}",
+                                    crate::util::format_bytes(BUDGET_CLAUDE_MD),
+                                    claude_over.join(", "),
+                                ));
+                            }
+                            println!("{COLOR_DIM}{line}{COLOR_RESET}");
+                        }
+                        if mem_index_bytes > 0 {
+                            let mut line =
+                                format!("  MEMORY.md              {}", crate::util::format_bytes(mem_index_bytes));
+                            if mem_index_bytes > BUDGET_MEMORY_INDEX {
+                                line.push_str(&format!(
+                                    "  ⚠ over {} cap",
+                                    crate::util::format_bytes(BUDGET_MEMORY_INDEX),
+                                ));
+                            }
+                            println!("{COLOR_DIM}{line}{COLOR_RESET}");
+                        }
+                        if !mem_entries.is_empty() {
+                            let mut line = format!(
+                                "  memory entries         {}  ({} file{})",
+                                crate::util::format_bytes(mem_entries_total),
+                                mem_entries.len(),
+                                if mem_entries.len() == 1 { "" } else { "s" },
+                            );
+                            if !mem_entries_over.is_empty() {
+                                line.push_str(&format!(
+                                    "  ⚠ over {} cap: {}",
+                                    crate::util::format_bytes(BUDGET_MEMORY_ENTRY),
+                                    mem_entries_over.join(", "),
+                                ));
+                            }
+                            println!("{COLOR_DIM}{line}{COLOR_RESET}");
+                        }
+                    }
                 }
                 SlashCommand::Version => {
                     let v = crate::version::info();
@@ -2484,10 +2681,67 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     let history = agent.history_snapshot();
                     let compacted = crate::compaction::compact(&history, agent.budget_tokens / 2);
                     agent.set_history(compacted.clone());
+                    let persist_note = match (&session_store, compacted.len() < history.len()) {
+                        (Some(store), true) => {
+                            let path = store.path_for(&session.id);
+                            match session.append_compaction_to(&path, &compacted) {
+                                Ok(()) => " (checkpoint saved)".to_string(),
+                                Err(e) => format!(" (checkpoint save failed: {e})"),
+                            }
+                        }
+                        _ => String::new(),
+                    };
                     println!(
-                        "{COLOR_DIM}compacted: {} → {} messages{COLOR_RESET}",
+                        "{COLOR_DIM}compacted: {} → {} messages{persist_note}{COLOR_RESET}",
                         history.len(),
                         compacted.len()
+                    );
+                }
+                SlashCommand::Fork => {
+                    // Save → build LLM summary → seed a fresh session
+                    // with the summary + recent turns. Same semantics
+                    // as the GUI's ForkWithSummary flow, but triggered
+                    // from the terminal/REPL.
+                    if let Some(store) = &session_store {
+                        let _ = store.save(&mut session);
+                    }
+                    let history = agent.history_snapshot();
+                    if history.is_empty() {
+                        println!(
+                            "{COLOR_DIM}/fork: nothing to summarize — history is empty{COLOR_RESET}"
+                        );
+                        continue;
+                    }
+                    let provider = match crate::repl::build_provider(&config) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            println!(
+                                "{COLOR_YELLOW}/fork: can't build provider: {e}{COLOR_RESET}"
+                            );
+                            continue;
+                        }
+                    };
+                    let target = agent.budget_tokens / 2;
+                    let summary_history = crate::compaction::compact_with_summary(
+                        &history,
+                        target,
+                        provider.as_ref(),
+                        &config.model,
+                    )
+                    .await;
+                    let old_id = session.id.clone();
+                    session = Session::new(&config.model, session.cwd.clone());
+                    agent.clear_history();
+                    agent.set_history(summary_history.clone());
+                    session.messages = summary_history.clone();
+                    if let Some(store) = &session_store {
+                        let _ = store.save(&mut session);
+                    }
+                    println!(
+                        "{COLOR_DIM}/fork: forked {old_id} → {} ({} → {} messages){COLOR_RESET}",
+                        session.id,
+                        history.len(),
+                        summary_history.len()
                     );
                 }
                 SlashCommand::Doctor => {
@@ -2825,6 +3079,35 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         None => println!(
                             "{COLOR_YELLOW}no KMS named '{name}'{COLOR_RESET}"
                         ),
+                    }
+                }
+                SlashCommand::KmsIngest { name, file, alias, force } => {
+                    let Some(k) = crate::kms::resolve(&name) else {
+                        println!(
+                            "{COLOR_YELLOW}no KMS named '{name}' (try /kms list or /kms new {name}){COLOR_RESET}"
+                        );
+                        continue;
+                    };
+                    let source = std::path::PathBuf::from(&file);
+                    let source = if source.is_absolute() {
+                        source
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .join(&source)
+                    };
+                    match crate::kms::ingest(&k, &source, alias.as_deref(), force) {
+                        Ok(r) => {
+                            let verb = if r.overwrote { "replaced" } else { "ingested" };
+                            println!(
+                                "{COLOR_DIM}{verb} → {} — {}{COLOR_RESET}",
+                                r.target.display(),
+                                r.summary,
+                            );
+                        }
+                        Err(e) => {
+                            println!("{COLOR_YELLOW}ingest failed: {e}{COLOR_RESET}");
+                        }
                     }
                 }
                 SlashCommand::Unknown(what) => {
@@ -3256,13 +3539,23 @@ mod tests {
     fn parse_slash_kms() {
         assert_eq!(parse_slash("/kms"), Some(SlashCommand::Kms));
         assert_eq!(parse_slash("/kms list"), Some(SlashCommand::Kms));
+        // Default scope is project — `./.thclaws/kms/<name>`.
         assert_eq!(
             parse_slash("/kms new default"),
             Some(SlashCommand::KmsNew {
                 name: "default".into(),
+                project: true,
+            })
+        );
+        // --user opts out into `~/.config/thclaws/kms/<name>`.
+        assert_eq!(
+            parse_slash("/kms new --user notes"),
+            Some(SlashCommand::KmsNew {
+                name: "notes".into(),
                 project: false,
             })
         );
+        // --project is still accepted as a no-op back-compat alias.
         assert_eq!(
             parse_slash("/kms new --project notes"),
             Some(SlashCommand::KmsNew {
@@ -3282,6 +3575,39 @@ mod tests {
             parse_slash("/kms show notes"),
             Some(SlashCommand::KmsShow("notes".into()))
         );
+        assert_eq!(
+            parse_slash("/kms ingest notes ./README.md"),
+            Some(SlashCommand::KmsIngest {
+                name: "notes".into(),
+                file: "./README.md".into(),
+                alias: None,
+                force: false,
+            })
+        );
+        assert_eq!(
+            parse_slash("/kms ingest notes ./doc.md as intro --force"),
+            Some(SlashCommand::KmsIngest {
+                name: "notes".into(),
+                file: "./doc.md".into(),
+                alias: Some("intro".into()),
+                force: true,
+            })
+        );
+        // `add` alias mirrors `ingest`.
+        assert_eq!(
+            parse_slash("/kms add notes ./file.txt"),
+            Some(SlashCommand::KmsIngest {
+                name: "notes".into(),
+                file: "./file.txt".into(),
+                alias: None,
+                force: false,
+            })
+        );
+        // Missing args → Unknown with usage hint.
+        assert!(matches!(
+            parse_slash("/kms ingest notes"),
+            Some(SlashCommand::Unknown(_))
+        ));
         // Missing name → Unknown with usage hint.
         assert!(matches!(
             parse_slash("/kms new"),

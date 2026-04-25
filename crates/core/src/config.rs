@@ -172,7 +172,7 @@ impl PermissionsConfig {
 /// Project-level config stored in `.thclaws/settings.json`.
 ///
 /// Also loads `.thclaws/mcp.json` for project-level MCP servers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectConfig {
     pub model: Option<String>,
@@ -207,7 +207,7 @@ pub struct ProjectConfig {
     /// enabled either way — subagents run in-process as a single recursive
     /// agent and don't spawn parallel processes, so they don't share the
     /// token-burn concern that motivated making Teams opt-in.
-    #[serde(rename = "teamEnabled")]
+    #[serde(rename = "teamEnabled", deserialize_with = "null_team_enabled_is_false")]
     pub team_enabled: Option<bool>,
     /// Print the assistant's raw text to stderr after each turn (dim, fenced
     /// block). Same effect as `THCLAWS_SHOW_RAW=1`. The env var wins if set.
@@ -216,6 +216,33 @@ pub struct ProjectConfig {
     pub show_raw_response: Option<bool>,
     /// Knowledge-base settings — `{ "active": ["name1", ...] }`.
     pub kms: Option<KmsSettings>,
+}
+
+fn null_team_enabled_is_false<'de, D>(d: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<bool>::deserialize(d)?.unwrap_or(false)))
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            permissions: None,
+            max_tokens: None,
+            max_iterations: None,
+            thinking_budget: None,
+            search_engine: None,
+            allowed_tools: None,
+            disallowed_tools: None,
+            window_width: None,
+            window_height: None,
+            team_enabled: Some(false),
+            show_raw_response: None,
+            kms: None,
+        }
+    }
 }
 
 /// On-disk shape of the KMS block in `.thclaws/settings.json`.
@@ -229,10 +256,18 @@ pub struct KmsSettings {
 }
 
 impl ProjectConfig {
+    /// Returns `<workspace>/.thclaws/`. Prefers `$THCLAWS_PROJECT_ROOT`
+    /// (set by SpawnTeammate when spawning into a worktree subdirectory)
+    /// so worktree teammates load the project's settings.json instead of
+    /// looking under their worktree cwd and falling through to user
+    /// config — same model as the sandbox's project-root resolution.
+    /// Falls back to current_dir for standalone (non-team) invocations.
     fn project_dir() -> PathBuf {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".thclaws")
+        let root = match std::env::var("THCLAWS_PROJECT_ROOT") {
+            Ok(s) if !s.is_empty() => PathBuf::from(s),
+            _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        root.join(".thclaws")
     }
 
     /// Primary path: `.thclaws/settings.json`
@@ -317,6 +352,14 @@ impl ProjectConfig {
 
     pub fn set_model(&mut self, model: &str) {
         self.model = Some(model.to_string());
+    }
+
+    /// Persist the permission mode (`"auto"` / `"ask"`) to project
+    /// settings. Overwrites any existing `{allow, deny}` block — GUI
+    /// and REPL only toggle the simple mode, so the complex form
+    /// rewrites whenever the user flips `/permissions`.
+    pub fn set_permissions_mode(&mut self, mode: &str) {
+        self.permissions = Some(PermissionsConfig::Mode(mode.to_string()));
     }
 
     /// Load project-level MCP servers. Checks (in order):
@@ -679,6 +722,26 @@ mod tests {
         let mut c = AppConfig::default();
         c.model = "mysterymodel".into();
         assert!(c.detect_provider().is_err());
+    }
+
+    #[test]
+    fn null_team_enabled_upgrades_to_false_on_load() {
+        let loaded: ProjectConfig =
+            serde_json::from_str(r#"{"teamEnabled": null}"#).unwrap();
+        assert_eq!(loaded.team_enabled, Some(false));
+        let reserialized = serde_json::to_string(&loaded).unwrap();
+        assert!(reserialized.contains(r#""teamEnabled":false"#));
+        assert!(!reserialized.contains(r#""teamEnabled":null"#));
+    }
+
+    #[test]
+    fn default_serializes_team_enabled_false_not_null() {
+        let json = serde_json::to_string(&ProjectConfig::default()).unwrap();
+        assert!(
+            json.contains(r#""teamEnabled":false"#),
+            "expected explicit false, got: {json}"
+        );
+        assert!(!json.contains(r#""teamEnabled":null"#));
     }
 
     #[test]

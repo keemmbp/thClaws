@@ -4,11 +4,31 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { send, subscribe } from "../hooks/useIPC";
 import { useTheme } from "../hooks/useTheme";
+import bannerText from "../../../banner.txt?raw";
 
-// xterm.js palettes keyed to the app's resolved theme.
+// xterm needs CRLF; the shared banner file uses plain LF so the Rust REPL
+// can println! it unchanged.
+const BANNER = bannerText.replace(/\n/g, "\r\n");
+
+// xterm.js palettes keyed to the app's resolved theme. selectionBackground
+// etc. aren't optional: if omitted, xterm's default is near-invisible
+// against our dark bg (selection happens, copy works, but the user can't
+// see what they've highlighted).
 const TERMINAL_PALETTES = {
-  dark: { background: "#0a0a0a", foreground: "#e6e6e6", cursor: "#e6e6e6" },
-  light: { background: "#fafafa", foreground: "#1a1a1a", cursor: "#1a1a1a" },
+  dark: {
+    background: "#0a0a0a",
+    foreground: "#e6e6e6",
+    cursor: "#e6e6e6",
+    selectionBackground: "#3a4858",
+    selectionInactiveBackground: "#2a3440",
+  },
+  light: {
+    background: "#fafafa",
+    foreground: "#1a1a1a",
+    cursor: "#1a1a1a",
+    selectionBackground: "#b4d5fe",
+    selectionInactiveBackground: "#d4e4fa",
+  },
 } as const;
 
 const PROMPT = "\x1b[32m❯ \x1b[0m";
@@ -62,6 +82,43 @@ export function TerminalView({ active }: Props) {
     // Reset to true on chat_done (next prompt is rendered) and on
     // local submit (line erased, no prompt visible until next turn).
     let promptShowing = false;
+    // Prompt-history ring for Up/Down arrow recall (bash-style). The
+    // array grows on every successful submit; `historyIndex === -1`
+    // means "not navigating — lineBuffer is the user's own typing".
+    // Anything else is an index into `history`, oldest at 0, newest
+    // at `history.length - 1`.
+    const history: string[] = [];
+    let historyIndex = -1;
+    // Snapshot of whatever the user had been typing before they
+    // started pressing Up, so Down past the newest entry restores it
+    // instead of clearing the line unexpectedly.
+    let savedDraft = "";
+
+    const replaceLineBuffer = (next: string) => {
+      term.write("\x1b[2K\r");
+      writePrompt();
+      lineBuffer = next;
+      if (next.length > 0) term.write(next);
+    };
+
+    // Record a successfully-submitted prompt in the recall ring.
+    // Skips exact duplicates of the most recent entry (Ctrl+↑ in bash
+    // etc. — no value in cycling through "ls ls ls"). Also resets the
+    // navigation cursor so the next Up arrow starts from the newest.
+    const HISTORY_MAX = 200;
+    const pushHistory = (entry: string) => {
+      const trimmed = entry.trim();
+      if (trimmed.length === 0) return;
+      if (history.length > 0 && history[history.length - 1] === trimmed) {
+        historyIndex = -1;
+        savedDraft = "";
+        return;
+      }
+      history.push(trimmed);
+      if (history.length > HISTORY_MAX) history.shift();
+      historyIndex = -1;
+      savedDraft = "";
+    };
 
     const writePrompt = () => {
       term.write(PROMPT);
@@ -70,7 +127,11 @@ export function TerminalView({ active }: Props) {
 
     // Print a banner + first prompt so the tab doesn't open empty.
     term.write(
-      "\x1b[2mthClaws — type a message, or /help for commands\x1b[0m\r\n",
+      "\x1b[36m" +
+        BANNER +
+        "\x1b[0m" +
+        "\r\n" +
+        "\x1b[2mthClaws — type a message, or /help for commands\x1b[0m\r\n",
     );
     writePrompt();
 
@@ -166,6 +227,41 @@ export function TerminalView({ active }: Props) {
     });
 
     term.onData((data) => {
+      // Up / Down arrows: walk through the prompt history just like
+      // bash. xterm delivers arrow keys as the escape sequences below
+      // in a single onData call, so matching the raw string is enough.
+      if (data === "\x1b[A") {
+        if (history.length === 0) return;
+        if (historyIndex === -1) {
+          savedDraft = lineBuffer;
+          historyIndex = history.length - 1;
+        } else if (historyIndex > 0) {
+          historyIndex -= 1;
+        }
+        replaceLineBuffer(history[historyIndex]);
+        return;
+      }
+      if (data === "\x1b[B") {
+        if (historyIndex === -1) return;
+        if (historyIndex < history.length - 1) {
+          historyIndex += 1;
+          replaceLineBuffer(history[historyIndex]);
+        } else {
+          // Past the newest entry — restore whatever the user was
+          // mid-typing before they started pressing Up.
+          historyIndex = -1;
+          replaceLineBuffer(savedDraft);
+          savedDraft = "";
+        }
+        return;
+      }
+      // Any other keystroke counts as "editing the current draft" so
+      // further Up/Down starts from a clean slate relative to that.
+      if (historyIndex !== -1) {
+        historyIndex = -1;
+        savedDraft = "";
+      }
+
       // Multi-line paste: a single onData chunk wider than one char
       // containing at least one newline is almost always a paste (or
       // bracketed-paste). Submit the WHOLE block as one shell_input so
@@ -182,6 +278,7 @@ export function TerminalView({ active }: Props) {
           // the whole paste in one block.
           term.write("\x1b[2K\r");
           promptShowing = false;
+          pushHistory(trimmed);
           send({ type: "shell_input", text: trimmed });
         } else {
           term.write("\r\n");
@@ -200,6 +297,7 @@ export function TerminalView({ active }: Props) {
             // shared session is the visible representation.
             term.write("\x1b[2K\r");
             promptShowing = false;
+            pushHistory(lineBuffer);
             send({ type: "shell_input", text: lineBuffer });
           } else {
             // Empty line: just newline + redraw prompt for the next try.
@@ -237,11 +335,25 @@ export function TerminalView({ active }: Props) {
         // `promptShowing` is what differentiates "fresh prompt
         // visible, clear it before printing" from "mid-stream, just
         // append".
+        const wasPrompt = promptShowing;
         if (promptShowing) {
           term.write("\x1b[2K\r");
           promptShowing = false;
         }
-        term.write(b64decode(msg.data));
+        const bytes = b64decode(msg.data);
+        term.write(bytes);
+        // Standalone info burst (prompt was up, message ends with a
+        // newline — e.g. `[mcp] '…' connected`). Restore the prompt +
+        // whatever the user was mid-typing so keystrokes keep their
+        // chevron instead of vanishing into an invisible line.
+        const endsWithNewline =
+          bytes.length >= 2 &&
+          bytes[bytes.length - 2] === 0x0d &&
+          bytes[bytes.length - 1] === 0x0a;
+        if (wasPrompt && endsWithNewline) {
+          writePrompt();
+          if (lineBuffer.length > 0) term.write(lineBuffer);
+        }
       } else if (msg.type === "chat_done") {
         // Turn complete — newline (if needed) + fresh prompt.
         term.write("\r\n");
@@ -252,6 +364,17 @@ export function TerminalView({ active }: Props) {
         term.clear();
         writePrompt();
         lineBuffer = "";
+      } else if (
+        msg.type === "terminal_history_replaced" &&
+        typeof msg.data === "string"
+      ) {
+        // Session load / new session: backend already embedded clear
+        // codes + (possibly empty) replayed messages. Always print a
+        // fresh prompt at the end so empty histories don't leave the
+        // terminal without a `❯`. Restore any in-progress typing.
+        term.write(b64decode(msg.data));
+        writePrompt();
+        if (lineBuffer.length > 0) term.write(lineBuffer);
       }
     });
 

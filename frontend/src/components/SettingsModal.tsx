@@ -208,12 +208,17 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     <div
       className="fixed inset-0 flex items-center justify-center z-50"
       style={{ background: "var(--modal-backdrop)" }}
-      onClick={onClose}
+      // Close on backdrop mousedown only when the gesture *started* on
+      // the backdrop — keeps drag-to-select inside the modal from
+      // accidentally dismissing it on mouseup outside.
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
       <div
         className="rounded-lg shadow-2xl p-5 max-w-xl w-full mx-4 max-h-[85vh] overflow-y-auto"
         style={{ background: "var(--bg-secondary)", border: "1px solid var(--border)" }}
-        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">

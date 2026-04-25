@@ -129,15 +129,76 @@ impl ProviderKind {
         }
     }
 
-    /// Resolve short model aliases to full names.
+    /// Resolve short model aliases to full names — **provider-blind**.
     /// e.g. "sonnet" → "claude-sonnet-4-6", "opus" → "claude-opus-4-6"
+    /// Use this for explicit user-typed `/model <alias>` commands where
+    /// the user intends to switch providers along with the model. For
+    /// passive resolution (agent defs, etc.) where the current provider
+    /// must be preserved, use `resolve_alias_for_provider` instead.
     pub fn resolve_alias(model: &str) -> String {
         match model {
             "sonnet" => "claude-sonnet-4-6".into(),
             "opus" => "claude-opus-4-6".into(),
             "haiku" => "claude-haiku-4-5".into(),
-            "flash" => "gemini-2.0-flash".into(),
+            "flash" => "gemini-2.5-flash".into(),
             other => other.to_string(),
+        }
+    }
+
+    /// Provider-aware alias resolution. Returns the full model id within
+    /// the given provider's namespace, or `None` if the alias doesn't
+    /// belong there (e.g. `sonnet` requested on a native OpenAI provider).
+    ///
+    /// Used by SpawnTeammate so that an agent def saying `model: sonnet`
+    /// keeps the team on the project's chosen provider — without this,
+    /// the global `resolve_alias` would surprise-switch a worktree
+    /// teammate to native Anthropic even if the project is on OpenRouter.
+    pub fn resolve_alias_for_provider(model: &str, provider: Self) -> Option<String> {
+        // Anthropic-family aliases.
+        let anthropic_id = match model {
+            "sonnet" => Some("claude-sonnet-4-6"),
+            "opus" => Some("claude-opus-4-6"),
+            "haiku" => Some("claude-haiku-4-5"),
+            _ => None,
+        };
+        // Google-family aliases (just `flash` for now).
+        let google_id = match model {
+            "flash" => Some("gemini-2.5-flash"),
+            _ => None,
+        };
+
+        match provider {
+            Self::Anthropic => anthropic_id.map(String::from),
+            Self::Gemini => google_id.map(String::from),
+            Self::OpenRouter => {
+                if let Some(id) = anthropic_id {
+                    return Some(format!("openrouter/anthropic/{id}"));
+                }
+                if let Some(id) = google_id {
+                    return Some(format!("openrouter/google/{id}"));
+                }
+                None
+            }
+            Self::AgenticPress => {
+                // ap/* mirrors the same families with an `ap/` prefix.
+                if let Some(id) = anthropic_id {
+                    return Some(format!("ap/{id}"));
+                }
+                if let Some(id) = google_id {
+                    return Some(format!("ap/{id}"));
+                }
+                None
+            }
+            // Providers without a notion of these aliases. Returning None
+            // signals "alias doesn't apply here" so the caller can fall
+            // back to whatever default the user had configured rather than
+            // surprise-switching to a different provider.
+            Self::OpenAI
+            | Self::OpenAIResponses
+            | Self::AgentSdk
+            | Self::Ollama
+            | Self::OllamaAnthropic
+            | Self::DashScope => None,
         }
     }
 
@@ -330,6 +391,11 @@ pub enum ProviderEvent {
         model: String,
     },
     TextDelta(String),
+    /// Reasoning/chain-of-thought delta from thinking models (DeepSeek
+    /// `reasoning_content`, OpenAI o-series reasoning, etc.). Folded by
+    /// `assemble` into a `ContentBlock::Thinking` block so the agent can
+    /// echo it back on subsequent turns (required by DeepSeek's API).
+    ThinkingDelta(String),
     ToolUseStart {
         id: String,
         name: String,
@@ -362,6 +428,79 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Provider-aware alias resolution must keep the alias inside the
+    /// caller's namespace. The whole point is to stop a passive agent-def
+    /// load (`model: sonnet`) from surprise-switching the team to native
+    /// Anthropic when the project chose OpenRouter.
+    #[test]
+    fn resolve_alias_for_provider_stays_in_namespace() {
+        // OpenRouter project → Anthropic-family aliases stay on OpenRouter.
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::OpenRouter)
+                .as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4-6"),
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("opus", ProviderKind::OpenRouter)
+                .as_deref(),
+            Some("openrouter/anthropic/claude-opus-4-6"),
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("flash", ProviderKind::OpenRouter)
+                .as_deref(),
+            Some("openrouter/google/gemini-2.5-flash"),
+        );
+
+        // Native Anthropic project → no prefix.
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::Anthropic)
+                .as_deref(),
+            Some("claude-sonnet-4-6"),
+        );
+
+        // Native Gemini project → flash resolves natively, sonnet doesn't.
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("flash", ProviderKind::Gemini)
+                .as_deref(),
+            Some("gemini-2.5-flash"),
+        );
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::Gemini),
+            None,
+        );
+
+        // Agentic Press mirrors the family names with `ap/` prefix.
+        assert_eq!(
+            ProviderKind::resolve_alias_for_provider("opus", ProviderKind::AgenticPress)
+                .as_deref(),
+            Some("ap/claude-opus-4-6"),
+        );
+
+        // Providers with no alias notion return None — caller falls back
+        // to default config rather than surprise-switching providers.
+        assert!(
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::OpenAI)
+                .is_none()
+        );
+        assert!(
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::Ollama)
+                .is_none()
+        );
+        assert!(
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::DashScope)
+                .is_none()
+        );
+
+        // Non-aliases pass through as None — they don't need translation.
+        assert!(
+            ProviderKind::resolve_alias_for_provider(
+                "claude-opus-4-7",
+                ProviderKind::OpenRouter
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn detect_gemini_and_gemma_go_to_gemini() {

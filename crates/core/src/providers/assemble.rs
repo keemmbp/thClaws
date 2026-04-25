@@ -17,6 +17,11 @@ use futures::{Stream, StreamExt};
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssembledEvent {
     Text(String),
+    /// Reasoning delta from a thinking model. Streamed live so the GUI can
+    /// surface it (collapsed by default), and folded into the persisted
+    /// assistant message so the next turn can echo it back to providers
+    /// that require it (DeepSeek v4-*, OpenAI o-series).
+    Thinking(String),
     /// Always `ContentBlock::ToolUse { id, name, input }`.
     ToolUse(ContentBlock),
     Done {
@@ -28,6 +33,10 @@ pub enum AssembledEvent {
 #[derive(Debug, Clone, Default)]
 pub struct TurnResult {
     pub text: String,
+    /// Concatenated reasoning_content from the turn (empty for non-thinking
+    /// models). Persisted as a `ContentBlock::Thinking` on the assistant
+    /// message so subsequent requests carry it back to the provider.
+    pub thinking: String,
     /// Each entry is a `ContentBlock::ToolUse`.
     pub tool_uses: Vec<ContentBlock>,
     pub stop_reason: Option<String>,
@@ -37,6 +46,7 @@ pub struct TurnResult {
 enum BlockState {
     None,
     Text,
+    Thinking,
     ToolUse {
         id: String,
         name: String,
@@ -58,6 +68,10 @@ where
                 ProviderEvent::TextDelta(s) => {
                     state = BlockState::Text;
                     yield AssembledEvent::Text(s);
+                }
+                ProviderEvent::ThinkingDelta(s) => {
+                    state = BlockState::Thinking;
+                    yield AssembledEvent::Thinking(s);
                 }
                 ProviderEvent::ToolUseStart { id, name } => {
                     state = BlockState::ToolUse {
@@ -103,6 +117,7 @@ where
     while let Some(ev) = stream.next().await {
         match ev? {
             AssembledEvent::Text(s) => out.text.push_str(&s),
+            AssembledEvent::Thinking(s) => out.thinking.push_str(&s),
             AssembledEvent::ToolUse(block) => out.tool_uses.push(block),
             AssembledEvent::Done { stop_reason, usage } => {
                 out.stop_reason = stop_reason;

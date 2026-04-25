@@ -15,8 +15,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -42,7 +44,8 @@ pub struct ApprovalRequest {
     pub summary: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     /// Approve this one call.
     Allow,
@@ -173,6 +176,120 @@ impl ApprovalSink for ReplApprover {
     }
 }
 
+/// One pending approval request that the GUI event loop should forward
+/// to the frontend. The id is how we pair the user's response (coming
+/// back via IPC) with the oneshot responder waiting inside
+/// [`GuiApprover::approve`].
+#[derive(Debug, Clone, Serialize)]
+pub struct GuiApprovalRequest {
+    pub id: u64,
+    pub tool_name: String,
+    pub input: Value,
+    pub summary: Option<String>,
+}
+
+/// Bridge between the agent's async `approve()` call and the GUI
+/// webview. Each approval request:
+///   1. registers a oneshot responder keyed by a fresh request id,
+///   2. ships a [`GuiApprovalRequest`] over the outbound mpsc so the
+///      event loop can render a modal in the frontend,
+///   3. awaits the responder — the GUI event loop calls
+///      [`GuiApprover::resolve`] when the user clicks a button.
+///
+/// `unresolved` also keeps the full request so the GUI forwarder can
+/// re-dispatch periodically. Necessary because early-startup
+/// dispatches can race the webview's React mount: `evaluate_script`
+/// runs before `window.__thclaws_dispatch` is defined and the call
+/// silently no-ops. Retrying until the user's response arrives
+/// (identified by id) avoids that race without complicating the
+/// frontend with a "ready" handshake.
+pub struct GuiApprover {
+    tx: mpsc::UnboundedSender<GuiApprovalRequest>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<ApprovalDecision>>>,
+    unresolved: Mutex<HashMap<u64, GuiApprovalRequest>>,
+    next_id: AtomicU64,
+    session_allowed: AtomicBool,
+}
+
+impl GuiApprover {
+    /// Returns the approver plus the receiver end the GUI event loop
+    /// must drain (one request per forwarded frontend dispatch).
+    pub fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<GuiApprovalRequest>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let approver = Arc::new(Self {
+            tx,
+            pending: Mutex::new(HashMap::new()),
+            unresolved: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            session_allowed: AtomicBool::new(false),
+        });
+        (approver, rx)
+    }
+
+    /// Satisfy the outstanding approve() call for `id`. Called by the
+    /// GUI event loop when the user clicks Allow / AllowForSession /
+    /// Deny in the approval modal.
+    pub fn resolve(&self, id: u64, decision: ApprovalDecision) {
+        if let Ok(mut u) = self.unresolved.lock() {
+            u.remove(&id);
+        }
+        let responder = self.pending.lock().ok().and_then(|mut m| m.remove(&id));
+        if let Some(responder) = responder {
+            let _ = responder.send(decision);
+        }
+    }
+
+    /// Snapshot of still-unresolved requests. The GUI forwarder polls
+    /// this on a timer to redispatch anything the webview may have
+    /// missed during its initial load.
+    pub fn unresolved_requests(&self) -> Vec<GuiApprovalRequest> {
+        self.unresolved
+            .lock()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl ApprovalSink for GuiApprover {
+    async fn approve(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        if self.session_allowed.load(Ordering::Relaxed) {
+            return ApprovalDecision::Allow;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(id, resp_tx);
+        }
+        let out = GuiApprovalRequest {
+            id,
+            tool_name: req.tool_name.clone(),
+            input: req.input.clone(),
+            summary: req.summary.clone(),
+        };
+        if let Ok(mut u) = self.unresolved.lock() {
+            u.insert(id, out.clone());
+        }
+        if self.tx.send(out).is_err() {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&id);
+            }
+            if let Ok(mut u) = self.unresolved.lock() {
+                u.remove(&id);
+            }
+            return ApprovalDecision::Deny;
+        }
+        match resp_rx.await {
+            Ok(ApprovalDecision::AllowForSession) => {
+                self.session_allowed.store(true, Ordering::Relaxed);
+                ApprovalDecision::Allow
+            }
+            Ok(d) => d,
+            Err(_) => ApprovalDecision::Deny,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +343,54 @@ mod tests {
         // Subsequent calls auto-allow even though the queue is empty.
         assert_eq!(a.approve(&req).await, ApprovalDecision::Allow);
         assert_eq!(a.approve(&req).await, ApprovalDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn gui_approver_round_trip() {
+        let (approver, mut rx) = GuiApprover::new();
+        let req = ApprovalRequest {
+            tool_name: "Write".into(),
+            input: serde_json::json!({"path": "foo.txt"}),
+            summary: Some("Write to foo.txt".into()),
+        };
+        let approver_for_task = approver.clone();
+        let call = tokio::spawn(async move { approver_for_task.approve(&req).await });
+        let outbound = rx.recv().await.expect("request forwarded");
+        assert_eq!(outbound.tool_name, "Write");
+        approver.resolve(outbound.id, ApprovalDecision::Allow);
+        assert_eq!(call.await.unwrap(), ApprovalDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn gui_approver_allow_for_session_sticks() {
+        let (approver, mut rx) = GuiApprover::new();
+        let req = ApprovalRequest {
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            summary: None,
+        };
+        // First call: user picks AllowForSession → Allow + flag flips.
+        let approver_c = approver.clone();
+        let req_c = req.clone();
+        let first = tokio::spawn(async move { approver_c.approve(&req_c).await });
+        let outbound = rx.recv().await.unwrap();
+        approver.resolve(outbound.id, ApprovalDecision::AllowForSession);
+        assert_eq!(first.await.unwrap(), ApprovalDecision::Allow);
+        // Second call: auto-allow without forwarding a new request.
+        assert_eq!(approver.approve(&req).await, ApprovalDecision::Allow);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn gui_approver_denies_when_receiver_dropped() {
+        let (approver, rx) = GuiApprover::new();
+        drop(rx);
+        let req = ApprovalRequest {
+            tool_name: "Write".into(),
+            input: serde_json::json!({}),
+            summary: None,
+        };
+        assert_eq!(approver.approve(&req).await, ApprovalDecision::Deny);
     }
 
     #[test]

@@ -189,7 +189,7 @@ export function CodeEditor({
   return (
     <div
       ref={containerRef}
-      className="flex-1 min-h-0 overflow-hidden rounded border"
+      className="flex-1 min-h-0 min-w-0 overflow-hidden rounded border"
       style={{ borderColor: "var(--border)" }}
     />
   );

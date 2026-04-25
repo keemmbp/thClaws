@@ -222,10 +222,162 @@ pub fn find_claude_md(start: &Path) -> Option<String> {
     }
 }
 
+/// Soft warning threshold (chars) for `CLAUDE.md` / `AGENTS.md`. Any single
+/// file at or above this size gets flagged — it's not truncated (Claude
+/// Code matches this behaviour), just surfaced so the user notices their
+/// team-memory file has grown past the point where the model is likely to
+/// read it carefully.
+pub const CLAUDE_MD_WARN_BYTES: u64 = 40_000;
+
+/// Metadata for one memory-file hit found during a `find_claude_md`-style
+/// walk. Used by [`scan_claude_md_oversize`] to report warnings without
+/// re-implementing the discovery order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeMdOversize {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+/// Walk the same locations [`find_claude_md`] does and collect every
+/// file's size. Used by `/context` to show per-contributor byte
+/// counts so users can see which memory file is driving their token
+/// spend. Pure filesystem walk — no read.
+pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
+    let mut out: Vec<(PathBuf, u64)> = Vec::new();
+    let mut check = |path: PathBuf| {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.is_file() {
+                out.push((path, meta.len()));
+            }
+        }
+    };
+    if let Some(home) = crate::util::home_dir() {
+        for candidate in [
+            home.join(".claude/CLAUDE.md"),
+            home.join(".claude/AGENTS.md"),
+            home.join(".config/thclaws/AGENTS.md"),
+            home.join(".config/thclaws/CLAUDE.md"),
+        ] {
+            check(candidate);
+        }
+    }
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            check(dir.join(name));
+        }
+        cur = dir.parent();
+    }
+    for path in [
+        start.join(".claude/CLAUDE.md"),
+        start.join(".thclaws/CLAUDE.md"),
+        start.join(".thclaws/AGENTS.md"),
+    ] {
+        check(path);
+    }
+    for rules_dir in [start.join(".claude/rules"), start.join(".thclaws/rules")] {
+        if let Ok(entries) = std::fs::read_dir(&rules_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("md") {
+                    check(path);
+                }
+            }
+        }
+    }
+    check(start.join("CLAUDE.local.md"));
+    out
+}
+
+/// Walk the same locations [`find_claude_md`] does and collect any
+/// file ≥ [`CLAUDE_MD_WARN_BYTES`]. Pure filesystem walk — no read —
+/// so it's cheap enough to call at every session startup.
+pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
+    let mut out = Vec::new();
+    let mut check = |path: PathBuf| {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.is_file() && meta.len() >= CLAUDE_MD_WARN_BYTES {
+                out.push(ClaudeMdOversize {
+                    path,
+                    bytes: meta.len(),
+                });
+            }
+        }
+    };
+
+    if let Some(home) = crate::util::home_dir() {
+        for candidate in [
+            home.join(".claude/CLAUDE.md"),
+            home.join(".claude/AGENTS.md"),
+            home.join(".config/thclaws/AGENTS.md"),
+            home.join(".config/thclaws/CLAUDE.md"),
+        ] {
+            check(candidate);
+        }
+    }
+
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            check(dir.join(name));
+        }
+        cur = dir.parent();
+    }
+
+    for path in [
+        start.join(".claude/CLAUDE.md"),
+        start.join(".thclaws/CLAUDE.md"),
+        start.join(".thclaws/AGENTS.md"),
+    ] {
+        check(path);
+    }
+
+    for rules_dir in [start.join(".claude/rules"), start.join(".thclaws/rules")] {
+        if let Ok(entries) = std::fs::read_dir(&rules_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("md") {
+                    check(path);
+                }
+            }
+        }
+    }
+
+    check(start.join("CLAUDE.local.md"));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Serializes tests that mutate `$HOME`. Reuses
+    /// `kms::test_env_lock` so HOME-touching tests across all modules
+    /// share the same mutex — otherwise a `context::tests` test could
+    /// rewrite HOME while a `kms::tests` test still reads it.
+    struct HomeGuard {
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        fn new(home: &Path) -> Self {
+            let lock = crate::kms::test_env_lock();
+            let prev = std::env::var("HOME").ok();
+            std::env::set_var("HOME", home);
+            Self { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
 
     #[test]
     fn git_info_from_outputs_clean() {
@@ -251,7 +403,26 @@ mod tests {
     }
 
     #[test]
+    fn scan_claude_md_oversize_flags_big_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(50_000)).unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "small").unwrap();
+        let hits = scan_claude_md_oversize(dir.path());
+        let paths: Vec<_> = hits.iter().map(|h| h.path.clone()).collect();
+        assert!(paths.contains(&dir.path().join("CLAUDE.md")));
+        assert!(!paths.contains(&dir.path().join("AGENTS.md")));
+    }
+
+    #[test]
+    fn scan_claude_md_oversize_silent_for_missing_files() {
+        let dir = tempdir().unwrap();
+        assert!(scan_claude_md_oversize(dir.path()).is_empty());
+    }
+
+    #[test]
     fn find_claude_md_finds_file_in_cwd() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "be concise").unwrap();
         assert_eq!(find_claude_md(dir.path()).as_deref(), Some("be concise"));
@@ -259,6 +430,8 @@ mod tests {
 
     #[test]
     fn find_claude_md_walks_up_to_find_ancestor() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
         let dir = tempdir().unwrap();
         let nested = dir.path().join("a/b/c");
         std::fs::create_dir_all(&nested).unwrap();
@@ -268,12 +441,16 @@ mod tests {
 
     #[test]
     fn find_claude_md_returns_none_when_absent() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
         let dir = tempdir().unwrap();
         assert!(find_claude_md(dir.path()).is_none());
     }
 
     #[test]
     fn find_claude_md_finds_agents_md_at_cwd() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "vendor-neutral rules").unwrap();
         assert_eq!(
@@ -284,6 +461,8 @@ mod tests {
 
     #[test]
     fn find_claude_md_includes_both_when_both_exist() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "claude rules").unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "agent rules").unwrap();
@@ -299,6 +478,8 @@ mod tests {
 
     #[test]
     fn find_claude_md_walks_up_to_find_agents_md() {
+        let home = tempdir().unwrap();
+        let _guard = HomeGuard::new(home.path());
         let dir = tempdir().unwrap();
         let nested = dir.path().join("a/b/c");
         std::fs::create_dir_all(&nested).unwrap();

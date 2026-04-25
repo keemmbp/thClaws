@@ -23,6 +23,21 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    /// Reasoning / chain-of-thought emitted by thinking models (DeepSeek
+    /// v4-*, OpenAI o1/o3, Anthropic extended thinking). Captured so it can
+    /// be echoed back on subsequent turns — DeepSeek's `reasoning_content`
+    /// requirement and Anthropic's signed-thinking blocks both reject
+    /// requests where prior thinking is missing from history.
+    ///
+    /// `signature` is only set by providers that emit one (Anthropic);
+    /// OpenAI-compat reasoning_content has no signature, so it stays None.
+    /// Providers that don't support thinking simply skip these blocks
+    /// during serialization — see `messages_to_*` impls.
+    Thinking {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,

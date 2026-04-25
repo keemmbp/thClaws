@@ -9,10 +9,23 @@ import { SettingsModal } from "./components/SettingsModal";
 import { SettingsMenu } from "./components/SettingsMenu";
 import { InstructionsEditorModal } from "./components/InstructionsEditorModal";
 import { SecretsBackendDialog } from "./components/SecretsBackendDialog";
+import { ApprovalModal } from "./components/ApprovalModal";
+import { ContextWarningBanner } from "./components/ContextWarningBanner";
 import { useEditingShortcuts } from "./hooks/useEditingShortcuts";
 import { send, subscribe } from "./hooks/useIPC";
 
 type Tab = "terminal" | "chat" | "files" | "team";
+
+// Fires `frontend_ready` once on mount. Mounted only after both
+// startup modals (working-directory + secrets-backend) dismiss, so
+// the backend can release deferred work like MCP-spawn approval
+// prompts that shouldn't race the launch modals.
+function FrontendReadyBeacon() {
+  useEffect(() => {
+    send({ type: "frontend_ready" });
+  }, []);
+  return null;
+}
 
 const ALL_TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "chat", label: "Chat", icon: <MessageSquare size={14} /> },
@@ -276,7 +289,7 @@ export default function App() {
 
   const [started, setStarted] = useState(false);
   const [currentCwd, setCurrentCwd] = useState("");
-  const [activeTab, setActiveTab] = useState<Tab>("chat");
+  const [activeTab, setActiveTab] = useState<Tab>("terminal");
   const [showSettings, setShowSettings] = useState(false);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
   const [instructionsScope, setInstructionsScope] =
@@ -304,16 +317,34 @@ export default function App() {
     return unsub;
   }, []);
 
-  // The Team tab is always present — TeamView renders an empty-state
-  // ("No team agents running — ask the agent to create a team") when
-  // there isn't one yet, so users don't have to flip a settings flag
-  // to discover the feature, and a freshly-created team's pane shows
-  // up the moment the user clicks the tab without waiting on a poll.
+  const [teamEnabled, setTeamEnabled] = useState(false);
 
-  const TABS = ALL_TABS;
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (
+        (msg.type === "team_enabled" || msg.type === "team_enabled_result") &&
+        typeof msg.enabled === "boolean"
+      ) {
+        setTeamEnabled(msg.enabled as boolean);
+      }
+    });
+    send({ type: "team_enabled_get" });
+    return unsub;
+  }, []);
+
+  useEffect(() => {
+    if (!teamEnabled && activeTab === "team") setActiveTab("chat");
+  }, [teamEnabled, activeTab]);
+
+  const TABS = teamEnabled ? ALL_TABS : ALL_TABS.filter((t) => t.id !== "team");
 
   if (!started) {
-    return <StartupModal onStart={(cwd) => { setCurrentCwd(cwd); setStarted(true); }} />;
+    return (
+      <>
+        <StartupModal onStart={(cwd) => { setCurrentCwd(cwd); setStarted(true); }} />
+        <ApprovalModal />
+      </>
+    );
   }
 
   // First launch only — after the user has picked a working directory
@@ -322,14 +353,18 @@ export default function App() {
   // startup: no choice, no prompt.
   if (secretsBackendChecked && secretsBackend === null) {
     return (
-      <SecretsBackendDialog
-        onPicked={(choice) => setSecretsBackend(choice)}
-      />
+      <>
+        <SecretsBackendDialog
+          onPicked={(choice) => setSecretsBackend(choice)}
+        />
+        <ApprovalModal />
+      </>
     );
   }
 
   return (
     <div className="flex flex-col h-screen">
+      <FrontendReadyBeacon />
       {/* Tab bar */}
       <div
         className="flex items-center gap-0 border-b select-none shrink-0"
@@ -451,6 +486,8 @@ export default function App() {
           onClose={() => setInstructionsScope(null)}
         />
       )}
+      <ApprovalModal />
+      <ContextWarningBanner />
     </div>
   );
 }

@@ -119,12 +119,20 @@ impl McpAllowlist {
 }
 
 /// Gate an MCP stdio spawn through an allowlist. The first time we see
-/// a given command string, prompt the user on the controlling TTY to
-/// approve it. If no TTY is attached (daemon / GUI path), refuse —
-/// the caller should route approval through a UI dialog.
-fn check_stdio_command_allowed(config: &McpServerConfig) -> Result<()> {
-    // An explicit environment override lets CI and the GUI bypass the
-    // TTY prompt once they have surfaced approval through their own UI.
+/// a given command string, ask the user to approve it.
+///
+/// If an `approver` is supplied (GUI mode wires a `GuiApprover`), the
+/// decision routes through the same approval UI used for tool calls —
+/// critical in GUI mode where blocking on stdin would freeze the
+/// whole process because the user is interacting with the webview,
+/// not the launching terminal. CLI REPL leaves `approver` = `None` and
+/// falls back to the legacy stderr/stdin prompt below.
+async fn check_stdio_command_allowed(
+    config: &McpServerConfig,
+    approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+) -> Result<()> {
+    // An explicit environment override lets CI and scripted runs skip
+    // the prompt once they have already vetted the MCP config.
     if std::env::var("THCLAWS_MCP_ALLOW_ALL").ok().as_deref() == Some("1") {
         return Ok(());
     }
@@ -134,6 +142,34 @@ fn check_stdio_command_allowed(config: &McpServerConfig) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(approver) = approver {
+        let req = crate::permissions::ApprovalRequest {
+            tool_name: "MCP server spawn".to_string(),
+            input: serde_json::json!({
+                "name": config.name,
+                "command": config.command,
+                "args": config.args,
+            }),
+            summary: Some(format!(
+                "Allow thClaws to spawn `{}` for MCP server `{}`? The \
+                 binary will run with your user privileges.",
+                config.command, config.name
+            )),
+        };
+        return match approver.approve(&req).await {
+            crate::permissions::ApprovalDecision::Allow
+            | crate::permissions::ApprovalDecision::AllowForSession => {
+                allowlist.insert(&config.command);
+                allowlist.save();
+                Ok(())
+            }
+            crate::permissions::ApprovalDecision::Deny => Err(Error::Provider(
+                format!("mcp spawn refused by user: `{}`", config.command),
+            )),
+        };
+    }
+
+    // Fallback: legacy stderr/stdin prompt. Still used by the CLI REPL.
     // Require a TTY to prompt; otherwise fail closed.
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
@@ -213,6 +249,14 @@ impl Drop for McpClient {
     }
 }
 
+impl std::fmt::Debug for McpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpClient")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
 impl McpClient {
     /// Build a client on top of any async stream pair. Starts a background
     /// reader task that parses incoming JSON-RPC messages and resolves pending
@@ -270,6 +314,18 @@ impl McpClient {
     /// - `"stdio"` (default): spawn a subprocess, attach stdin/stdout.
     /// - `"http"`: POST JSON-RPC to `config.url` per request.
     pub async fn spawn(config: McpServerConfig) -> Result<Arc<Self>> {
+        Self::spawn_with_approver(config, None).await
+    }
+
+    /// Same as [`spawn`] but lets the caller provide an `ApprovalSink`
+    /// for the first-time spawn prompt. GUI mode passes its
+    /// `GuiApprover` here so MCP approval pops up in the same modal as
+    /// tool-call approval. Callers without an approver keep the stdin
+    /// fallback.
+    pub async fn spawn_with_approver(
+        config: McpServerConfig,
+        approver: Option<Arc<dyn crate::permissions::ApprovalSink>>,
+    ) -> Result<Arc<Self>> {
         if config.transport == "http" {
             return Self::connect_http(config).await;
         }
@@ -279,7 +335,7 @@ impl McpClient {
         // malicious `.thclaws/mcp.json` could point `command` at an
         // arbitrary binary. Require explicit per-command approval the
         // first time we see it and persist the decision.
-        check_stdio_command_allowed(&config)?;
+        check_stdio_command_allowed(&config, approver).await?;
 
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args)
