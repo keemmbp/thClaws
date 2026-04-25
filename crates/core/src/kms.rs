@@ -318,12 +318,8 @@ pub fn ingest(
     alias: Option<&str>,
     force: bool,
 ) -> Result<IngestResult> {
-    let meta = std::fs::metadata(source).map_err(|e| {
-        Error::Tool(format!(
-            "cannot stat source '{}': {e}",
-            source.display()
-        ))
-    })?;
+    let meta = std::fs::metadata(source)
+        .map_err(|e| Error::Tool(format!("cannot stat source '{}': {e}", source.display())))?;
     if !meta.is_file() {
         return Err(Error::Tool(format!(
             "source '{}' is not a regular file",
@@ -331,16 +327,13 @@ pub fn ingest(
         )));
     }
 
-    let ext_raw = source
-        .extension()
-        .and_then(|e| e.to_str())
-        .ok_or_else(|| {
-            Error::Tool(format!(
-                "'{}' has no extension — ingest requires one of: {}",
-                source.display(),
-                INGEST_EXTENSIONS.join(", "),
-            ))
-        })?;
+    let ext_raw = source.extension().and_then(|e| e.to_str()).ok_or_else(|| {
+        Error::Tool(format!(
+            "'{}' has no extension — ingest requires one of: {}",
+            source.display(),
+            INGEST_EXTENSIONS.join(", "),
+        ))
+    })?;
     let ext = ext_raw.to_ascii_lowercase();
     if !INGEST_EXTENSIONS.iter().any(|e| *e == ext) {
         return Err(Error::Tool(format!(
@@ -363,7 +356,10 @@ pub fn ingest(
             "alias '{raw_alias}' sanitises to empty — use [A-Za-z0-9_-] characters"
         )));
     }
-    if RESERVED_PAGE_STEMS.iter().any(|r| r.eq_ignore_ascii_case(&alias)) {
+    if RESERVED_PAGE_STEMS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(&alias))
+    {
         return Err(Error::Tool(format!(
             "alias '{alias}' is reserved — pick another"
         )));
@@ -404,7 +400,13 @@ fn sanitize_alias(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     cleaned.trim_matches('_').to_string()
 }
@@ -747,7 +749,10 @@ mod tests {
         ingest(&k, &src, Some("topic"), false).unwrap();
         let err = ingest(&k, &src, Some("topic"), false).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("already exists"), "expected collision, got: {msg}");
+        assert!(
+            msg.contains("already exists"),
+            "expected collision, got: {msg}"
+        );
 
         // --force replaces, and is flagged as overwrote.
         std::fs::write(&src, "b").unwrap();

@@ -42,9 +42,7 @@ impl Tool for WriteTool {
         // Narrow exception: when a git merge is in progress AND the file
         // currently contains conflict markers, the lead is mid-merge-
         // resolution and that's the one legitimate lead-author activity.
-        if crate::team::is_team_lead()
-            && !crate::team::lead_resolving_merge_conflict(&validated)
-        {
+        if crate::team::is_team_lead() && !crate::team::lead_resolving_merge_conflict(&validated) {
             return Err(Error::Tool(format!(
                 "team lead may not write source files (path: {raw_path}). Lead is a COORDINATOR — delegate every code change to the responsible teammate via SendMessage. (Exception: when a git merge is in progress and this file has `<<<<<<<` markers, you may write the resolved version. That doesn't apply here — there's no active merge or this file isn't conflicted.)"
             )));

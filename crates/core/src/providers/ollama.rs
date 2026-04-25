@@ -68,7 +68,9 @@ impl OllamaProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!("ollama /api/show {status}: {text}")));
+            return Err(Error::Provider(format!(
+                "ollama /api/show {status}: {text}"
+            )));
         }
         let v: Value = resp
             .json()
@@ -565,9 +567,9 @@ mod tests {
 
     #[tokio::test]
     async fn show_strips_ollama_prefix_from_model_id() {
+        use serde_json::json;
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use serde_json::json;
 
         let server = MockServer::start().await;
         let body = r#"{"parameters":"num_ctx 4096"}"#;

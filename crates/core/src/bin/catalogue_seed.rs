@@ -105,18 +105,21 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<String, String> {
-    let target: PathBuf = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
-        if Path::new(DEFAULT_TARGET).exists() {
-            DEFAULT_TARGET.into()
-        } else {
-            "resources/model_catalogue.json".into()
-        }
-    });
+    let target: PathBuf = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if Path::new(DEFAULT_TARGET).exists() {
+                DEFAULT_TARGET.into()
+            } else {
+                "resources/model_catalogue.json".into()
+            }
+        });
 
-    let existing = std::fs::read_to_string(&target)
-        .map_err(|e| format!("read {}: {e}", target.display()))?;
-    let mut cat: Catalogue = serde_json::from_str(&existing)
-        .map_err(|e| format!("parse {}: {e}", target.display()))?;
+    let existing =
+        std::fs::read_to_string(&target).map_err(|e| format!("read {}: {e}", target.display()))?;
+    let mut cat: Catalogue =
+        serde_json::from_str(&existing).map_err(|e| format!("parse {}: {e}", target.display()))?;
     if cat.schema != CURRENT_SCHEMA {
         return Err(format!(
             "target has schema {}, expected {CURRENT_SCHEMA}",
@@ -210,9 +213,7 @@ async fn run() -> Result<String, String> {
                     .collect();
                 let filtered = before - rows.len();
                 let added = merge_gemini(&mut cat, rows, &today);
-                let suffix = format!(
-                    "({filtered} filtered: imagen/veo/gemma/embedding/tts)"
-                );
+                let suffix = format!("({filtered} filtered: imagen/veo/gemma/embedding/tts)");
                 push_provider_stats(&mut report, "gemini", &added, Some(&suffix));
             }
             Err(e) => report.push(format!("  gemini:      FAILED ({e})")),
@@ -316,7 +317,10 @@ fn merge_openrouter(cat: &mut Catalogue, rows: Vec<OpenRouterModel>, today: &str
             m.id.clone(),
             ModelEntry {
                 context: Some(ctx),
-                max_output: m.top_provider.as_ref().and_then(|p| p.max_completion_tokens),
+                max_output: m
+                    .top_provider
+                    .as_ref()
+                    .and_then(|p| p.max_completion_tokens),
                 source: Some(OPENROUTER_URL.into()),
                 verified_at: Some(today.into()),
             },
@@ -392,7 +396,11 @@ fn merge_gemini(cat: &mut Catalogue, rows: Vec<GeminiModel>, today: &str) -> Mer
     for m in rows {
         // Gemini returns ids like `models/gemini-1.5-pro` — strip the
         // leading `models/` to match the rest of the codebase.
-        let id = m.name.strip_prefix("models/").unwrap_or(&m.name).to_string();
+        let id = m
+            .name
+            .strip_prefix("models/")
+            .unwrap_or(&m.name)
+            .to_string();
         let Some(ctx) = m.input_token_limit else {
             stats.skipped_no_context += 1;
             continue;

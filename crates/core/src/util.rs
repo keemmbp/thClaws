@@ -23,10 +23,7 @@ pub fn home_dir() -> Option<PathBuf> {
                 return Some(PathBuf::from(h));
             }
         }
-        if let (Ok(d), Ok(p)) = (
-            std::env::var("HOMEDRIVE"),
-            std::env::var("HOMEPATH"),
-        ) {
+        if let (Ok(d), Ok(p)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
             if !d.is_empty() && !p.is_empty() {
                 return Some(PathBuf::from(format!("{d}{p}")));
             }

@@ -285,7 +285,9 @@ pub fn parse_slash(input: &str) -> Option<SlashCommand> {
         "models" => match args.trim() {
             "refresh" => SlashCommand::ModelsRefresh,
             "" => SlashCommand::Models,
-            other => SlashCommand::Unknown(format!("unknown /models subcommand: '{other}' (try /models or /models refresh)")),
+            other => SlashCommand::Unknown(format!(
+                "unknown /models subcommand: '{other}' (try /models or /models refresh)"
+            )),
         },
         "provider" => SlashCommand::Provider(args.to_string()),
         "providers" => SlashCommand::Providers,

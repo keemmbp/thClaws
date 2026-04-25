@@ -17,7 +17,7 @@
 
 use crate::config::AppConfig;
 use crate::session::SessionStore;
-use crate::shared_session::{ShellInput, SharedSessionHandle, ViewEvent};
+use crate::shared_session::{SharedSessionHandle, ShellInput, ViewEvent};
 use base64::Engine;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -64,10 +64,7 @@ const MAX_RECENT_DIRS: usize = 3;
 // bytes). Both tabs subscribe to their respective shapes and render
 // the same conversation.
 
-fn spawn_event_translator(
-    handle: &SharedSessionHandle,
-    proxy: EventLoopProxy<UserEvent>,
-) {
+fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<UserEvent>) {
     let mut rx = handle.subscribe();
     std::thread::spawn(move || {
         // tokio runtime so we can `.recv().await` on the broadcast.
@@ -218,10 +215,7 @@ fn strip_ansi(s: &str) -> String {
                             i += 1;
                             break;
                         }
-                        if bytes[i] == 0x1b
-                            && i + 1 < bytes.len()
-                            && bytes[i + 1] == b'\\'
-                        {
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
                             i += 2;
                             break;
                         }
@@ -255,7 +249,10 @@ mod ansi_strip_tests {
     #[test]
     fn strips_csi_sgr() {
         assert_eq!(strip_ansi("\x1b[2mhello\x1b[0m"), "hello");
-        assert_eq!(strip_ansi("\x1b[31;1mred bold\x1b[0m text"), "red bold text");
+        assert_eq!(
+            strip_ansi("\x1b[31;1mred bold\x1b[0m text"),
+            "red bold text"
+        );
     }
 
     #[test]
@@ -411,9 +408,13 @@ fn render_markdown_to_html(md: &str, theme: &str) -> String {
     // query so that a user explicitly choosing Light while their OS is
     // Dark (or vice versa) is honoured.
     let (fg, bg, muted, accent, code_bg, border, color_scheme) = if theme == "light" {
-        ("#1a1a1a", "#ffffff", "#606366", "#2867c4", "#f3f4f6", "#d0d7de", "light")
+        (
+            "#1a1a1a", "#ffffff", "#606366", "#2867c4", "#f3f4f6", "#d0d7de", "light",
+        )
     } else {
-        ("#e6e6e6", "#1a1a1a", "#9aa0a6", "#6cb0ff", "#2a2a2a", "#333", "dark")
+        (
+            "#e6e6e6", "#1a1a1a", "#9aa0a6", "#6cb0ff", "#2a2a2a", "#333", "dark",
+        )
     };
 
     format!(
@@ -526,7 +527,10 @@ fn load_theme() -> String {
         return "system".to_string();
     };
     let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_default();
-    let mode = parsed.get("mode").and_then(|v| v.as_str()).unwrap_or("system");
+    let mode = parsed
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("system");
     normalize_theme(mode).to_string()
 }
 
@@ -538,7 +542,10 @@ fn save_theme(mode: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let payload = serde_json::json!({ "mode": normalize_theme(mode) });
-    let _ = std::fs::write(path, serde_json::to_string_pretty(&payload).unwrap_or_default());
+    let _ = std::fs::write(
+        path,
+        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    );
 }
 
 /// Convert a frontend-supplied path (always slash-separated, since it
@@ -620,10 +627,7 @@ fn native_confirm(title: &str, message: &str, yes_label: &str, no_label: &str) -
         // what. Backported from public repo (commit 7339bc0): replaces
         // PowerShell shell-out with the `native_dialog` crate, dodging
         // PowerShell's quote-escaping quirks.
-        let prompt = format!(
-            "{}\n\nYes = {}   No = {}",
-            message, yes_label, no_label,
-        );
+        let prompt = format!("{}\n\nYes = {}   No = {}", message, yes_label, no_label,);
         DialogBuilder::message()
             .set_level(MessageLevel::Info)
             .set_title(title)
@@ -848,8 +852,7 @@ pub fn run_gui() {
                             "input": req.input,
                             "summary": req.summary,
                         });
-                        let _ = proxy_inner
-                            .send_event(UserEvent::Dispatch(payload.to_string()));
+                        let _ = proxy_inner.send_event(UserEvent::Dispatch(payload.to_string()));
                     }
                 }
             });
@@ -861,8 +864,7 @@ pub fn run_gui() {
                     "input": req.input,
                     "summary": req.summary,
                 });
-                let _ = proxy_for_approval
-                    .send_event(UserEvent::Dispatch(payload.to_string()));
+                let _ = proxy_for_approval.send_event(UserEvent::Dispatch(payload.to_string()));
             }
         });
     });

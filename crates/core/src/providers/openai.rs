@@ -876,15 +876,18 @@ mod tests {
             "data: {\"id\":\"1\",\"model\":\"deepseek/deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}",
             "data: {\"id\":\"1\",\"model\":\"deepseek/deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
         ]);
-        let kinds: Vec<&str> = events.iter().map(|e| match e {
-            ProviderEvent::MessageStart { .. } => "MessageStart",
-            ProviderEvent::ThinkingDelta(_) => "ThinkingDelta",
-            ProviderEvent::TextDelta(_) => "TextDelta",
-            ProviderEvent::ToolUseStart { .. } => "ToolUseStart",
-            ProviderEvent::ToolUseDelta { .. } => "ToolUseDelta",
-            ProviderEvent::ContentBlockStop => "ContentBlockStop",
-            ProviderEvent::MessageStop { .. } => "MessageStop",
-        }).collect();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                ProviderEvent::MessageStart { .. } => "MessageStart",
+                ProviderEvent::ThinkingDelta(_) => "ThinkingDelta",
+                ProviderEvent::TextDelta(_) => "TextDelta",
+                ProviderEvent::ToolUseStart { .. } => "ToolUseStart",
+                ProviderEvent::ToolUseDelta { .. } => "ToolUseDelta",
+                ProviderEvent::ContentBlockStop => "ContentBlockStop",
+                ProviderEvent::MessageStop { .. } => "MessageStop",
+            })
+            .collect();
         assert_eq!(
             kinds,
             vec!["MessageStart", "ThinkingDelta", "TextDelta", "MessageStop"]
@@ -928,7 +931,9 @@ mod tests {
                         content: "think think".into(),
                         signature: None,
                     },
-                    ContentBlock::Text { text: "x = 42".into() },
+                    ContentBlock::Text {
+                        text: "x = 42".into(),
+                    },
                 ],
             },
             Message::user("now y"),
@@ -959,7 +964,10 @@ mod tests {
             thinking_budget: None,
         };
         let msgs_plain = OpenAIProvider::messages_to_openai(&req_plain);
-        let assistant_plain = msgs_plain.iter().find(|m| m["role"] == "assistant").unwrap();
+        let assistant_plain = msgs_plain
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
         assert_eq!(assistant_plain["content"], "x = 42");
         assert!(
             assistant_plain.get("reasoning_content").is_none(),

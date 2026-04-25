@@ -49,8 +49,7 @@ pub const GLOBAL_FALLBACK: u32 = 128_000;
 /// How often the auto-refresh background task is allowed to hit the
 /// network — once per day, with `fetched_at` in the cache as the
 /// marker.
-pub const AUTO_REFRESH_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(24 * 60 * 60);
+pub const AUTO_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Embedded baseline catalogue. Shipped with every build so first
 /// launch (no cache, no internet) still has real context-window data.
@@ -192,7 +191,9 @@ impl Catalogue {
     }
 
     pub fn provider_default(&self, provider: &str) -> Option<u32> {
-        self.providers.get(provider).and_then(|pc| pc.default_context)
+        self.providers
+            .get(provider)
+            .and_then(|pc| pc.default_context)
     }
 }
 
@@ -273,10 +274,7 @@ pub fn effective_context_window(model: &str) -> u32 {
     effective_context_window_with(&EffectiveCatalogue::load(), model).0
 }
 
-pub fn effective_context_window_with(
-    cat: &EffectiveCatalogue,
-    model: &str,
-) -> (u32, bool) {
+pub fn effective_context_window_with(cat: &EffectiveCatalogue, model: &str) -> (u32, bool) {
     if let Some(n) = cat.lookup_exact(model) {
         return (n, true);
     }
@@ -455,8 +453,7 @@ mod tests {
 
     #[test]
     fn baseline_parses() {
-        let c = Catalogue::from_json_str(BASELINE_JSON)
-            .expect("baseline catalogue must parse");
+        let c = Catalogue::from_json_str(BASELINE_JSON).expect("baseline catalogue must parse");
         assert_eq!(c.schema, CURRENT_SCHEMA);
         assert!(c.providers.contains_key("anthropic"));
         let anth = c.providers.get("anthropic").unwrap();
@@ -481,10 +478,8 @@ mod tests {
             cache: None,
             baseline: Catalogue::from_json_str(BASELINE_JSON).unwrap(),
         };
-        let (n, known) = effective_context_window_with(
-            &c,
-            "openrouter/anthropic/claude-sonnet-4-6",
-        );
+        let (n, known) =
+            effective_context_window_with(&c, "openrouter/anthropic/claude-sonnet-4-6");
         assert_eq!(n, 200_000);
         assert!(known);
     }
@@ -611,10 +606,15 @@ mod tests {
         let c = Catalogue::from_json_str(json).expect("parses");
         // Entry exists, context stays None.
         assert!(c.providers["dashscope"].models.contains_key("qwen3-0.6b"));
-        assert!(c.providers["dashscope"].models["qwen3-0.6b"].context.is_none());
+        assert!(c.providers["dashscope"].models["qwen3-0.6b"]
+            .context
+            .is_none());
         // Lookup misses — caller applies provider default.
         assert!(c.lookup_context("qwen3-0.6b").is_none());
-        let eff = EffectiveCatalogue { cache: None, baseline: c };
+        let eff = EffectiveCatalogue {
+            cache: None,
+            baseline: c,
+        };
         let (n, known) = effective_context_window_with(&eff, "qwen3-0.6b");
         assert_eq!(n, 131072); // from dashscope.default_context
         assert!(!known); // provider-default, not a verified entry
@@ -638,7 +638,10 @@ mod tests {
         }"#;
         let c = Catalogue::from_json_str(json).expect("parses");
         assert_eq!(c.lookup_context("claude-sonnet-4-6"), Some(200_000));
-        assert_eq!(c.lookup_context("claude-sonnet-4-6-20261001"), Some(200_000));
+        assert_eq!(
+            c.lookup_context("claude-sonnet-4-6-20261001"),
+            Some(200_000)
+        );
     }
 
     #[test]
@@ -661,8 +664,14 @@ mod tests {
             "fallback": 128000
         }"#;
         let c = Catalogue::from_json_str(json).expect("parses");
-        let e = c.providers["anthropic"].models.get("claude-sonnet-4-6").unwrap();
-        assert_eq!(e.source.as_deref(), Some("https://docs.anthropic.com/models"));
+        let e = c.providers["anthropic"]
+            .models
+            .get("claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(
+            e.source.as_deref(),
+            Some("https://docs.anthropic.com/models")
+        );
         assert_eq!(e.verified_at.as_deref(), Some("2026-04-24"));
         assert_eq!(e.max_output, Some(8192));
         // Entries without the optional fields still parse.

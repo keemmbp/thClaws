@@ -207,7 +207,10 @@ pub struct ProjectConfig {
     /// enabled either way — subagents run in-process as a single recursive
     /// agent and don't spawn parallel processes, so they don't share the
     /// token-burn concern that motivated making Teams opt-in.
-    #[serde(rename = "teamEnabled", deserialize_with = "null_team_enabled_is_false")]
+    #[serde(
+        rename = "teamEnabled",
+        deserialize_with = "null_team_enabled_is_false"
+    )]
     pub team_enabled: Option<bool>,
     /// Print the assistant's raw text to stderr after each turn (dim, fenced
     /// block). Same effect as `THCLAWS_SHOW_RAW=1`. The env var wins if set.
@@ -726,8 +729,7 @@ mod tests {
 
     #[test]
     fn null_team_enabled_upgrades_to_false_on_load() {
-        let loaded: ProjectConfig =
-            serde_json::from_str(r#"{"teamEnabled": null}"#).unwrap();
+        let loaded: ProjectConfig = serde_json::from_str(r#"{"teamEnabled": null}"#).unwrap();
         assert_eq!(loaded.team_enabled, Some(false));
         let reserialized = serde_json::to_string(&loaded).unwrap();
         assert!(reserialized.contains(r#""teamEnabled":false"#));

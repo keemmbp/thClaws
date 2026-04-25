@@ -1221,10 +1221,8 @@ impl Tool for SpawnTeammateTool {
         //       `isolation: worktree` (persistent agent defs), or
         //   (b) the team config member has `isolation: "worktree"`
         //       (set declaratively at TeamCreate time for ad-hoc teams).
-        let iso_from_member = member
-            .as_ref()
-            .and_then(|m| m.isolation.as_deref())
-            == Some("worktree");
+        let iso_from_member =
+            member.as_ref().and_then(|m| m.isolation.as_deref()) == Some("worktree");
         let iso_from_def = agent_def.and_then(|d| d.isolation.as_deref()) == Some("worktree");
         let worktree_path = if iso_from_member || iso_from_def {
             let project_root = std::env::current_dir().unwrap_or_default();

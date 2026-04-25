@@ -422,7 +422,11 @@ pub fn lead_forbidden_command(cmd: &str) -> Option<&'static str> {
     if !crate::team::is_team_lead() {
         return None;
     }
-    let collapsed: String = cmd.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed: String = cmd
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let lower = format!(" {collapsed} ");
 
     let blocked: &[(&str, &str)] = &[
@@ -432,13 +436,25 @@ pub fn lead_forbidden_command(cmd: &str) -> Option<&'static str> {
         ("git push --force", "rewrite shared history with force-push"),
         ("git push -f ", "rewrite shared history with force-push"),
         ("git rebase", "rewrite committed history"),
-        ("git worktree remove", "kill a teammate's active worktree (and its process)"),
-        ("git worktree prune", "purge worktree metadata referenced by live teammates"),
+        (
+            "git worktree remove",
+            "kill a teammate's active worktree (and its process)",
+        ),
+        (
+            "git worktree prune",
+            "purge worktree metadata referenced by live teammates",
+        ),
         ("git checkout -- ", "discard a teammate's uncommitted work"),
         ("git checkout .", "discard a teammate's uncommitted work"),
-        ("git restore --worktree", "discard a teammate's uncommitted work"),
+        (
+            "git restore --worktree",
+            "discard a teammate's uncommitted work",
+        ),
         ("git restore .", "discard a teammate's uncommitted work"),
-        ("git merge --abort", "tear down a merge instead of resolving via the responsible teammate"),
+        (
+            "git merge --abort",
+            "tear down a merge instead of resolving via the responsible teammate",
+        ),
         ("rm -rf", "destructively remove files"),
         ("rm -fr", "destructively remove files"),
         ("rm -r ", "recursively remove files"),

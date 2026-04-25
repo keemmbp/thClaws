@@ -14,7 +14,9 @@
 
 use crate::repl::{default_model_for_provider, parse_slash, render_help, SlashCommand};
 use crate::session::Session;
-use crate::shared_session::{build_session_list, save_history, DisplayMessage, ViewEvent, WorkerState};
+use crate::shared_session::{
+    build_session_list, save_history, DisplayMessage, ViewEvent, WorkerState,
+};
 use crate::util::{format_bytes, format_tokens, progress_bar};
 use tokio::sync::broadcast;
 
@@ -73,7 +75,8 @@ pub async fn dispatch(
                 .map(|(p, n)| {
                     format!(
                         "{} ({})",
-                        p.file_name().map(|n| n.to_string_lossy().into_owned())
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| p.display().to_string()),
                         format_bytes(*n),
                     )
@@ -294,9 +297,7 @@ pub async fn dispatch(
             if rows.is_empty() {
                 emit(
                     events_tx,
-                    format!(
-                        "no models catalogued for '{provider_name}'. Run /models refresh."
-                    ),
+                    format!("no models catalogued for '{provider_name}'. Run /models refresh."),
                 );
                 return;
             }
@@ -348,12 +349,12 @@ pub async fn dispatch(
                     // in the live catalogue (which drifts as providers
                     // ship/retire models), fall back to the first
                     // available model rather than aborting.
-                    Some(m) => switch_model(state, m, events_tx, /* fallback_to_first */ true).await,
+                    Some(m) => {
+                        switch_model(state, m, events_tx, /* fallback_to_first */ true).await
+                    }
                     None => emit(
                         events_tx,
-                        format!(
-                            "unknown provider: {arg} (try: anthropic, openai, gemini, ollama)"
-                        ),
+                        format!("unknown provider: {arg} (try: anthropic, openai, gemini, ollama)"),
                     ),
                 }
             }
@@ -362,8 +363,7 @@ pub async fn dispatch(
         // ─── session ─────────────────────────────────────────────────
         SlashCommand::Clear => {
             state.agent.clear_history();
-            state.session =
-                Session::new(&state.config.model, state.cwd.to_string_lossy());
+            state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
             let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
             emit(events_tx, "(history cleared)".into());
         }
@@ -375,9 +375,7 @@ pub async fn dispatch(
                 } else {
                     state.session.sync(history);
                     match store.save(&mut state.session) {
-                        Ok(p) => {
-                            emit(events_tx, format!("session saved → {}", p.display()))
-                        }
+                        Ok(p) => emit(events_tx, format!("session saved → {}", p.display())),
                         Err(e) => emit(events_tx, format!("save failed: {e}")),
                     }
                 }
@@ -391,13 +389,10 @@ pub async fn dispatch(
                     || id.eq_ignore_ascii_case("latest")
                     || id.is_empty()
                 {
-                    store
-                        .list()
-                        .ok()
-                        .and_then(|mut list| {
-                            list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                            list.into_iter().next().map(|m| m.id)
-                        })
+                    store.list().ok().and_then(|mut list| {
+                        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                        list.into_iter().next().map(|m| m.id)
+                    })
                 } else {
                     Some(id.to_string())
                 };
@@ -511,7 +506,10 @@ pub async fn dispatch(
             let arg = arg.trim();
             if arg.is_empty() {
                 let budget = state.agent.thinking_budget.unwrap_or(0);
-                emit(events_tx, format!("thinking budget: {budget} tokens (0 = off)"));
+                emit(
+                    events_tx,
+                    format!("thinking budget: {budget} tokens (0 = off)"),
+                );
             } else {
                 match arg.parse::<u32>() {
                     Ok(0) => {
@@ -567,7 +565,10 @@ pub async fn dispatch(
             save_history(&state.agent, &mut state.session, &state.session_store);
             let history = state.agent.history_snapshot();
             if history.is_empty() {
-                emit(events_tx, "/fork: nothing to summarize — history is empty".into());
+                emit(
+                    events_tx,
+                    "/fork: nothing to summarize — history is empty".into(),
+                );
                 return;
             }
             let provider = match crate::repl::build_provider(&state.config) {
@@ -614,8 +615,7 @@ pub async fn dispatch(
             if let Some(store) = &state.session_store {
                 let _ = store.save(&mut state.session);
             }
-            let display =
-                crate::shared_session::DisplayMessage::from_messages(&summary_history);
+            let display = crate::shared_session::DisplayMessage::from_messages(&summary_history);
             let _ = events_tx.send(crate::shared_session::ViewEvent::HistoryReplaced(display));
             let _ = events_tx.send(crate::shared_session::ViewEvent::SessionListRefresh(
                 build_session_list(&state.session_store, &state.session.id),
@@ -650,8 +650,11 @@ pub async fn dispatch(
                     let mut out = String::from("Memory:\n");
                     for e in entries {
                         let kind = e.memory_type.unwrap_or_default();
-                        let kind_label =
-                            if kind.is_empty() { String::new() } else { format!(" ({kind})") };
+                        let kind_label = if kind.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({kind})")
+                        };
                         out.push_str(&format!("  {}{kind_label} — {}\n", e.name, e.description));
                     }
                     emit(events_tx, out);
@@ -701,10 +704,17 @@ pub async fn dispatch(
                     out.push_str(&format!("path: {}\n", skill.dir.display()));
                     emit(events_tx, out);
                 }
-                None => emit(events_tx, format!("unknown skill: '{name}' — /skills to list")),
+                None => emit(
+                    events_tx,
+                    format!("unknown skill: '{name}' — /skills to list"),
+                ),
             }
         }
-        SlashCommand::SkillInstall { git_url, name, project } => {
+        SlashCommand::SkillInstall {
+            git_url,
+            name,
+            project,
+        } => {
             match crate::skills::install_from_url(&git_url, name.as_deref(), project).await {
                 Ok(report) => {
                     // Live refresh: replace the SkillTool's store
@@ -731,14 +741,21 @@ pub async fn dispatch(
         SlashCommand::Kms => {
             let all = crate::kms::list_all();
             if all.is_empty() {
-                emit(events_tx, "no knowledge bases yet — try: /kms new default".into());
+                emit(
+                    events_tx,
+                    "no knowledge bases yet — try: /kms new default".into(),
+                );
             } else {
                 let active: std::collections::HashSet<&String> =
                     state.config.kms_active.iter().collect();
                 let mut out = String::from("Knowledge bases:\n");
                 for k in &all {
                     let marker = if active.contains(&k.name) { "*" } else { " " };
-                    out.push_str(&format!("  {marker} {:<16} ({})\n", k.name, k.scope.as_str()));
+                    out.push_str(&format!(
+                        "  {marker} {:<16} ({})\n",
+                        k.name,
+                        k.scope.as_str()
+                    ));
                 }
                 out.push_str("(* = attached to this project; toggle with /kms use | /kms off)");
                 emit(events_tx, out);
@@ -776,9 +793,9 @@ pub async fn dispatch(
                 emit(events_tx, format!("KMS '{name}' already attached"));
             } else {
                 state.config.kms_active.push(name.clone());
-                if let Err(e) = crate::config::ProjectConfig::set_active_kms(
-                    state.config.kms_active.clone(),
-                ) {
+                if let Err(e) =
+                    crate::config::ProjectConfig::set_active_kms(state.config.kms_active.clone())
+                {
                     emit(events_tx, format!("save failed: {e}"));
                     return;
                 }
@@ -809,9 +826,9 @@ pub async fn dispatch(
             if state.config.kms_active.len() == before {
                 emit(events_tx, format!("KMS '{name}' was not attached"));
             } else {
-                if let Err(e) = crate::config::ProjectConfig::set_active_kms(
-                    state.config.kms_active.clone(),
-                ) {
+                if let Err(e) =
+                    crate::config::ProjectConfig::set_active_kms(state.config.kms_active.clone())
+                {
                     emit(events_tx, format!("save failed: {e}"));
                     return;
                 }
@@ -849,7 +866,12 @@ pub async fn dispatch(
             }
             None => emit(events_tx, format!("no KMS named '{name}'")),
         },
-        SlashCommand::KmsIngest { name, file, alias, force } => {
+        SlashCommand::KmsIngest {
+            name,
+            file,
+            alias,
+            force,
+        } => {
             let Some(k) = crate::kms::resolve(&name) else {
                 emit(
                     events_tx,
@@ -868,11 +890,7 @@ pub async fn dispatch(
                     let verb = if r.overwrote { "replaced" } else { "ingested" };
                     emit(
                         events_tx,
-                        format!(
-                            "{verb} → {} — {}",
-                            r.target.display(),
-                            r.summary,
-                        ),
+                        format!("{verb} → {} — {}", r.target.display(), r.summary,),
                     );
                     // No kms_update broadcast — ingest doesn't change
                     // the list of KMSes or their active state. The
@@ -892,7 +910,11 @@ pub async fn dispatch(
             } else {
                 let mut out = String::from("MCP servers:\n");
                 for s in servers {
-                    let kind = if s.transport == "http" { "http" } else { "stdio" };
+                    let kind = if s.transport == "http" {
+                        "http"
+                    } else {
+                        "stdio"
+                    };
                     out.push_str(&format!("  {} ({kind})\n", s.name));
                 }
                 emit(events_tx, out);
@@ -980,9 +1002,10 @@ pub async fn dispatch(
                         ),
                     );
                 }
-                Ok((false, p)) => {
-                    emit(events_tx, format!("no server named '{name}' in {}", p.display()))
-                }
+                Ok((false, p)) => emit(
+                    events_tx,
+                    format!("no server named '{name}' in {}", p.display()),
+                ),
                 Err(e) => emit(events_tx, format!("remove failed: {e}")),
             }
         }
@@ -991,7 +1014,10 @@ pub async fn dispatch(
         SlashCommand::Plugins => {
             let plugins = crate::plugins::all_plugins_all_scopes();
             if plugins.is_empty() {
-                emit(events_tx, "no plugins installed (try /plugin install <url>)".into());
+                emit(
+                    events_tx,
+                    "no plugins installed (try /plugin install <url>)".into(),
+                );
             } else {
                 let mut out = String::from("Plugins:\n");
                 for p in plugins {
@@ -1046,23 +1072,30 @@ pub async fn dispatch(
                 Err(e) => emit(events_tx, format!("plugin install failed: {e}")),
             }
         }
-        SlashCommand::PluginRemove { name, user } => {
-            match crate::plugins::remove(&name, user) {
-                Ok(true) => emit(events_tx, format!("plugin '{name}' removed (restart to drop its contributions)")),
-                Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
-                Err(e) => emit(events_tx, format!("remove failed: {e}")),
-            }
-        }
+        SlashCommand::PluginRemove { name, user } => match crate::plugins::remove(&name, user) {
+            Ok(true) => emit(
+                events_tx,
+                format!("plugin '{name}' removed (restart to drop its contributions)"),
+            ),
+            Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
+            Err(e) => emit(events_tx, format!("remove failed: {e}")),
+        },
         SlashCommand::PluginEnable { name, user } => {
             match crate::plugins::set_enabled(&name, user, true) {
-                Ok(true) => emit(events_tx, format!("plugin '{name}' enabled (restart to pick up its contributions)")),
+                Ok(true) => emit(
+                    events_tx,
+                    format!("plugin '{name}' enabled (restart to pick up its contributions)"),
+                ),
                 Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
                 Err(e) => emit(events_tx, format!("enable failed: {e}")),
             }
         }
         SlashCommand::PluginDisable { name, user } => {
             match crate::plugins::set_enabled(&name, user, false) {
-                Ok(true) => emit(events_tx, format!("plugin '{name}' disabled (restart to drop its contributions)")),
+                Ok(true) => emit(
+                    events_tx,
+                    format!("plugin '{name}' disabled (restart to drop its contributions)"),
+                ),
                 Ok(false) => emit(events_tx, format!("no plugin named '{name}' in that scope")),
                 Err(e) => emit(events_tx, format!("disable failed: {e}")),
             }
@@ -1070,8 +1103,16 @@ pub async fn dispatch(
         SlashCommand::PluginShow { name } => match crate::plugins::find_installed(&name) {
             Some(p) => {
                 let status = if p.enabled { "enabled" } else { "disabled" };
-                let version = if p.version.is_empty() { "-" } else { &p.version };
-                let mut out = format!("{} v{version} ({status})\npath: {}\n", p.name, p.path.display());
+                let version = if p.version.is_empty() {
+                    "-"
+                } else {
+                    &p.version
+                };
+                let mut out = format!(
+                    "{} v{version} ({status})\npath: {}\n",
+                    p.name,
+                    p.path.display()
+                );
                 if !p.source.is_empty() {
                     out.push_str(&format!("source: {}\n", p.source));
                 }
@@ -1128,7 +1169,10 @@ async fn switch_model(
 ) {
     let resolved_initial = crate::providers::ProviderKind::resolve_alias(new_model);
     if resolved_initial != new_model {
-        emit(events_tx, format!("(alias '{new_model}' → '{resolved_initial}')"));
+        emit(
+            events_tx,
+            format!("(alias '{new_model}' → '{resolved_initial}')"),
+        );
     }
     let mut candidate = state.config.clone();
     candidate.model = resolved_initial.clone();
@@ -1242,10 +1286,10 @@ async fn switch_model(
         );
         let mut resolved_via_ollama = false;
         if is_ollama {
-            let base = std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| {
-                crate::providers::ollama::DEFAULT_BASE_URL.to_string()
-            });
-            let ollama = crate::providers::ollama::OllamaProvider::new().with_base_url(base.clone());
+            let base = std::env::var("OLLAMA_BASE_URL")
+                .unwrap_or_else(|_| crate::providers::ollama::DEFAULT_BASE_URL.to_string());
+            let ollama =
+                crate::providers::ollama::OllamaProvider::new().with_base_url(base.clone());
             let model_id = state.config.model.clone();
             match ollama.show(&model_id).await {
                 Ok((n, which)) => {
@@ -1259,11 +1303,8 @@ async fn switch_model(
                         source: Some(format!("ollama://{base}/api/show ({which})")),
                         verified_at: Some(crate::model_catalogue::today_iso()),
                     };
-                    match crate::model_catalogue::upsert_cache_entry(
-                        provider_key,
-                        &model_id,
-                        entry,
-                    ) {
+                    match crate::model_catalogue::upsert_cache_entry(provider_key, &model_id, entry)
+                    {
                         Ok(()) => {
                             emit(
                                 events_tx,
@@ -1275,7 +1316,9 @@ async fn switch_model(
                         }
                         Err(e) => emit(
                             events_tx,
-                            format!("scanned Ollama context ({n} tokens) but cache write failed: {e}"),
+                            format!(
+                                "scanned Ollama context ({n} tokens) but cache write failed: {e}"
+                            ),
                         ),
                     }
                 }
@@ -1342,7 +1385,11 @@ fn doctor_report(state: &WorkerState) -> String {
             }
         })
         .unwrap_or_else(|| "none".into());
-    let tmux = if crate::team::has_tmux() { "available ✓" } else { "not found" };
+    let tmux = if crate::team::has_tmux() {
+        "available ✓"
+    } else {
+        "not found"
+    };
 
     format!(
         "── thClaws diagnostics ──\n\

@@ -40,9 +40,7 @@ impl Tool for EditTool {
         // Same rationale as Write: lead is a coordinator, never the author.
         // Narrow exception for active merge-conflict resolution — see
         // write.rs for the full reasoning.
-        if crate::team::is_team_lead()
-            && !crate::team::lead_resolving_merge_conflict(&path)
-        {
+        if crate::team::is_team_lead() && !crate::team::lead_resolving_merge_conflict(&path) {
             return Err(Error::Tool(format!(
                 "team lead may not edit source files (path: {raw_path}). Lead is a COORDINATOR — delegate every code change to the responsible teammate via SendMessage. (Exception: when a git merge is in progress and this file has `<<<<<<<` markers, you may edit the conflict markers out. That doesn't apply here.)"
             )));

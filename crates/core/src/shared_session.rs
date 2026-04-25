@@ -111,8 +111,14 @@ pub enum ShellInput {
 pub enum ViewEvent {
     UserPrompt(String),
     AssistantTextDelta(String),
-    ToolCallStart { name: String, label: String },
-    ToolCallResult { name: String, output: String },
+    ToolCallStart {
+        name: String,
+        label: String,
+    },
+    ToolCallResult {
+        name: String,
+        output: String,
+    },
     SlashOutput(String),
     TurnDone,
     HistoryReplaced(Vec<DisplayMessage>),
@@ -131,7 +137,9 @@ pub enum ViewEvent {
     /// The session's on-disk JSONL has crossed the fork threshold.
     /// Frontend renders a dismissible banner with a "Fork into new
     /// session with summary" action. Fired once per session.
-    ContextWarning { file_size_mb: f64 },
+    ContextWarning {
+        file_size_mb: f64,
+    },
     ErrorText(String),
 }
 
@@ -402,9 +410,8 @@ pub fn spawn_with_approver(
             } else {
                 "shared session panicked".to_string()
             };
-            let _ = events_tx_for_thread.send(ViewEvent::ErrorText(format!(
-                "internal error: {msg}"
-            )));
+            let _ =
+                events_tx_for_thread.send(ViewEvent::ErrorText(format!("internal error: {msg}")));
         }
     });
 
@@ -429,9 +436,8 @@ async fn run_worker(
 
     // Shared SkillTool store — we keep a handle in WorkerState so
     // `/skill install` can repopulate it without restarting.
-    let skill_store = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::skills::SkillStore::discover(),
-    ));
+    let skill_store =
+        std::sync::Arc::new(std::sync::Mutex::new(crate::skills::SkillStore::discover()));
 
     let mut tools = ToolRegistry::with_builtins();
     if !config.kms_active.is_empty() {
@@ -512,11 +518,8 @@ async fn run_worker(
         let input_tx_for_spawn = input_tx_self.clone();
         tokio::spawn(async move {
             let server_name = server_cfg.name.clone();
-            match crate::mcp::McpClient::spawn_with_approver(
-                server_cfg,
-                Some(approver_for_spawn),
-            )
-            .await
+            match crate::mcp::McpClient::spawn_with_approver(server_cfg, Some(approver_for_spawn))
+                .await
             {
                 Ok(client) => match client.list_tools().await {
                     Ok(tool_infos) => {
@@ -552,8 +555,8 @@ async fn run_worker(
             return;
         }
     };
-    let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
-        .with_approver(approver.clone());
+    let mut agent =
+        Agent::new(provider, tools.clone(), &config.model, &system).with_approver(approver.clone());
     // Respect the user's configured permission mode (project
     // `.thclaws/settings.json` can set it to "ask"). Without this the
     // GUI's Ask mode flag had no effect because the Agent was built
@@ -634,8 +637,7 @@ async fn run_worker(
             ShellInput::NewSession => {
                 save_history(&state.agent, &mut state.session, &state.session_store);
                 state.agent.clear_history();
-                state.session =
-                    Session::new(&state.config.model, state.cwd.to_string_lossy());
+                state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
                 state.warned_file_size = false;
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
                 let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
@@ -644,7 +646,9 @@ async fn run_worker(
                 )));
             }
             ShellInput::LoadSession(id) => {
-                let Some(ref store) = state.session_store else { continue };
+                let Some(ref store) = state.session_store else {
+                    continue;
+                };
                 let Ok(loaded) = store.load(&id) else {
                     let _ = events_tx.send(ViewEvent::ErrorText(format!(
                         "Failed to load session '{id}'"
@@ -660,14 +664,13 @@ async fn run_worker(
                 // provider has no credentials configured, refuse the
                 // load rather than swap to something that will hard-
                 // error on the next turn.
-                let current_kind =
-                    crate::providers::ProviderKind::detect(&state.config.model);
-                let loaded_kind =
-                    crate::providers::ProviderKind::detect(&loaded.model);
-                let needs_switch =
-                    loaded_kind.is_some() && current_kind != loaded_kind;
+                let current_kind = crate::providers::ProviderKind::detect(&state.config.model);
+                let loaded_kind = crate::providers::ProviderKind::detect(&loaded.model);
+                let needs_switch = loaded_kind.is_some() && current_kind != loaded_kind;
                 if needs_switch {
-                    let Some(target_kind) = loaded_kind else { continue };
+                    let Some(target_kind) = loaded_kind else {
+                        continue;
+                    };
                     if !kind_has_credentials(target_kind) {
                         let provider_name = target_kind.name();
                         let env_hint = target_kind
@@ -699,8 +702,7 @@ async fn run_worker(
                     )));
                     // Keep `.thclaws/settings.json` in sync so a
                     // restart lands on the same provider/model.
-                    let mut project =
-                        crate::config::ProjectConfig::load().unwrap_or_default();
+                    let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
                     project.set_model(&state.config.model);
                     let _ = project.save();
                     // Push the sidebar immediately so the Provider /
@@ -816,11 +818,7 @@ async fn run_worker(
     }
 }
 
-pub(crate) fn save_history(
-    agent: &Agent,
-    session: &mut Session,
-    store: &Option<SessionStore>,
-) {
+pub(crate) fn save_history(agent: &Agent, session: &mut Session, store: &Option<SessionStore>) {
     let history = agent.history_snapshot();
     if history.is_empty() {
         return;
@@ -831,10 +829,7 @@ pub(crate) fn save_history(
     }
 }
 
-pub(crate) fn build_session_list(
-    store: &Option<SessionStore>,
-    current_id: &str,
-) -> String {
+pub(crate) fn build_session_list(store: &Option<SessionStore>, current_id: &str) -> String {
     let sessions: Vec<serde_json::Value> = store
         .as_ref()
         .and_then(|s| s.list().ok())
@@ -870,7 +865,10 @@ async fn handle_line(
     }
 
     let _ = events_tx.send(ViewEvent::UserPrompt(trimmed.to_string()));
-    write_lead_log(&state.lead_log, &format!("\n\x1b[36m❯ {trimmed}\x1b[0m\n\x1b[32m"));
+    write_lead_log(
+        &state.lead_log,
+        &format!("\n\x1b[36m❯ {trimmed}\x1b[0m\n\x1b[32m"),
+    );
 
     if trimmed.starts_with('/') {
         crate::shell_dispatch::dispatch(trimmed, state, events_tx).await;
@@ -895,8 +893,10 @@ async fn handle_line(
             let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
             write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
             save_history(&state.agent, &mut state.session, &state.session_store);
-            let _ = events_tx
-                .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store, &state.session.id)));
+            let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                &state.session_store,
+                &state.session.id,
+            )));
             let _ = events_tx.send(ViewEvent::TurnDone);
             let _ = lead_mb.write_status("lead", "active", None);
             return;
@@ -917,10 +917,7 @@ async fn handle_line(
             Ok(AgentEvent::ToolCallResult { name, output, .. }) => {
                 let out = output.unwrap_or_else(|e| e);
                 write_lead_log(&state.lead_log, "\x1b[90m✓\x1b[0m\n\x1b[32m");
-                let _ = events_tx.send(ViewEvent::ToolCallResult {
-                    name,
-                    output: out,
-                });
+                let _ = events_tx.send(ViewEvent::ToolCallResult { name, output: out });
             }
             Ok(AgentEvent::Done { usage, .. }) => {
                 write_lead_log(&state.lead_log, "\x1b[0m\n");
@@ -929,17 +926,17 @@ async fn handle_line(
                 // REPL — option C's chat port missed this, so the
                 // GUI shell silently dropped every turn's usage
                 // regardless of provider).
-                let provider_name =
-                    state.config.detect_provider().unwrap_or("unknown");
-                let tracker = crate::usage::UsageTracker::new(
-                    crate::usage::UsageTracker::default_path(),
-                );
+                let provider_name = state.config.detect_provider().unwrap_or("unknown");
+                let tracker =
+                    crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
                 tracker.record(provider_name, &state.config.model, &usage);
 
                 save_history(&state.agent, &mut state.session, &state.session_store);
                 maybe_warn_file_size(state, events_tx);
-                let _ = events_tx
-                    .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store, &state.session.id)));
+                let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                    &state.session_store,
+                    &state.session.id,
+                )));
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
             Err(e) => {
@@ -956,10 +953,7 @@ async fn handle_line(
     }
 }
 
-fn write_lead_log(
-    log: &std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
-    s: &str,
-) {
+fn write_lead_log(log: &std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>, s: &str) {
     use std::io::Write;
     if let Ok(mut guard) = log.lock() {
         if let Some(ref mut f) = *guard {
@@ -1026,8 +1020,10 @@ async fn handle_team_messages(
             let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
             write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
             save_history(&state.agent, &mut state.session, &state.session_store);
-            let _ = events_tx
-                .send(ViewEvent::SessionListRefresh(build_session_list(&state.session_store, &state.session.id)));
+            let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                &state.session_store,
+                &state.session.id,
+            )));
             let _ = events_tx.send(ViewEvent::TurnDone);
             let _ = lead_mb.write_status("lead", "active", None);
             return;
@@ -1240,7 +1236,10 @@ fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
 
 fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
     let detail = match name {
-        "Skill" => input.get("name").and_then(|v| v.as_str()).map(|n| format!("({n})")),
+        "Skill" => input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|n| format!("({n})")),
         "Task" => input
             .get("agent")
             .and_then(|v| v.as_str())
@@ -1257,9 +1256,10 @@ fn format_tool_label(name: &str, input: &serde_json::Value) -> String {
             .get("pattern")
             .and_then(|v| v.as_str())
             .map(|p| format!("({p})")),
-        "WebFetch" => input.get("url").and_then(|v| v.as_str()).map(|u| {
-            format!("({})", u.chars().take(60).collect::<String>())
-        }),
+        "WebFetch" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|u| format!("({})", u.chars().take(60).collect::<String>())),
         "WebSearch" => input
             .get("query")
             .and_then(|v| v.as_str())
@@ -1342,9 +1342,13 @@ pub(crate) fn maybe_warn_file_size(
         return;
     }
     const THRESHOLD_BYTES: u64 = 5 * 1024 * 1024;
-    let Some(store) = &state.session_store else { return };
+    let Some(store) = &state.session_store else {
+        return;
+    };
     let path = store.path_for(&state.session.id);
-    let Ok(meta) = std::fs::metadata(&path) else { return };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
     if meta.len() < THRESHOLD_BYTES {
         return;
     }

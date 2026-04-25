@@ -437,32 +437,27 @@ mod tests {
     fn resolve_alias_for_provider_stays_in_namespace() {
         // OpenRouter project → Anthropic-family aliases stay on OpenRouter.
         assert_eq!(
-            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::OpenRouter)
-                .as_deref(),
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::OpenRouter).as_deref(),
             Some("openrouter/anthropic/claude-sonnet-4-6"),
         );
         assert_eq!(
-            ProviderKind::resolve_alias_for_provider("opus", ProviderKind::OpenRouter)
-                .as_deref(),
+            ProviderKind::resolve_alias_for_provider("opus", ProviderKind::OpenRouter).as_deref(),
             Some("openrouter/anthropic/claude-opus-4-6"),
         );
         assert_eq!(
-            ProviderKind::resolve_alias_for_provider("flash", ProviderKind::OpenRouter)
-                .as_deref(),
+            ProviderKind::resolve_alias_for_provider("flash", ProviderKind::OpenRouter).as_deref(),
             Some("openrouter/google/gemini-2.5-flash"),
         );
 
         // Native Anthropic project → no prefix.
         assert_eq!(
-            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::Anthropic)
-                .as_deref(),
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::Anthropic).as_deref(),
             Some("claude-sonnet-4-6"),
         );
 
         // Native Gemini project → flash resolves natively, sonnet doesn't.
         assert_eq!(
-            ProviderKind::resolve_alias_for_provider("flash", ProviderKind::Gemini)
-                .as_deref(),
+            ProviderKind::resolve_alias_for_provider("flash", ProviderKind::Gemini).as_deref(),
             Some("gemini-2.5-flash"),
         );
         assert_eq!(
@@ -472,34 +467,24 @@ mod tests {
 
         // Agentic Press mirrors the family names with `ap/` prefix.
         assert_eq!(
-            ProviderKind::resolve_alias_for_provider("opus", ProviderKind::AgenticPress)
-                .as_deref(),
+            ProviderKind::resolve_alias_for_provider("opus", ProviderKind::AgenticPress).as_deref(),
             Some("ap/claude-opus-4-6"),
         );
 
         // Providers with no alias notion return None — caller falls back
         // to default config rather than surprise-switching providers.
+        assert!(ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::OpenAI).is_none());
+        assert!(ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::Ollama).is_none());
         assert!(
-            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::OpenAI)
-                .is_none()
-        );
-        assert!(
-            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::Ollama)
-                .is_none()
-        );
-        assert!(
-            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::DashScope)
-                .is_none()
+            ProviderKind::resolve_alias_for_provider("sonnet", ProviderKind::DashScope).is_none()
         );
 
         // Non-aliases pass through as None — they don't need translation.
-        assert!(
-            ProviderKind::resolve_alias_for_provider(
-                "claude-opus-4-7",
-                ProviderKind::OpenRouter
-            )
-            .is_none()
-        );
+        assert!(ProviderKind::resolve_alias_for_provider(
+            "claude-opus-4-7",
+            ProviderKind::OpenRouter
+        )
+        .is_none());
     }
 
     #[test]

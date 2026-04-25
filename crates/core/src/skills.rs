@@ -629,9 +629,7 @@ impl SkillTool {
     /// keeps in WorkerState, so `/skill install` can repopulate the
     /// store without needing to find and mutate the tool through the
     /// registry.
-    pub fn new_from_handle(
-        store: std::sync::Arc<std::sync::Mutex<SkillStore>>,
-    ) -> Self {
+    pub fn new_from_handle(store: std::sync::Arc<std::sync::Mutex<SkillStore>>) -> Self {
         Self { store }
     }
 

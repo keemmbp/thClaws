@@ -92,8 +92,7 @@ impl Agent {
         // → global fallback). This drives auto-compact + `/compact` +
         // `/fork` thresholds so they match the model in use rather
         // than a blanket hardcoded number.
-        let budget_tokens =
-            crate::model_catalogue::effective_context_window(&model) as usize;
+        let budget_tokens = crate::model_catalogue::effective_context_window(&model) as usize;
         Self {
             provider,
             tools,

@@ -367,8 +367,7 @@ mod tests {
 
     #[test]
     fn truncate_index_caps_at_200_lines() {
-        let lines: Vec<String> =
-            (0..500).map(|i| format!("- entry {i}")).collect();
+        let lines: Vec<String> = (0..500).map(|i| format!("- entry {i}")).collect();
         let s = lines.join("\n");
         let out = truncate_index(&s);
         // First 200 entries + notice block.

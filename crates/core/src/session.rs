@@ -334,11 +334,7 @@ impl Session {
     /// messages added *after* the checkpoint. The raw message events
     /// that preceded the checkpoint stay on disk (audit trail) but will
     /// be overridden by the checkpoint on load.
-    pub fn append_compaction_to(
-        &mut self,
-        path: &Path,
-        compacted: &[Message],
-    ) -> Result<()> {
+    pub fn append_compaction_to(&mut self, path: &Path, compacted: &[Message]) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -602,9 +598,8 @@ impl SessionStore {
         Self::validate_id(id)?;
         let path = self.path_for(id);
         if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                Error::Config(format!("failed to delete session '{id}': {e}"))
-            })?;
+            std::fs::remove_file(&path)
+                .map_err(|e| Error::Config(format!("failed to delete session '{id}': {e}")))?;
         }
         Ok(())
     }

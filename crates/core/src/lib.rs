@@ -15,10 +15,6 @@ pub mod endpoints;
 pub mod error;
 #[cfg(feature = "gui")]
 pub mod gui;
-#[cfg(feature = "gui")]
-pub mod shared_session;
-#[cfg(feature = "gui")]
-pub mod shell_dispatch;
 pub mod hooks;
 pub mod kms;
 pub mod mcp;
@@ -33,6 +29,10 @@ pub mod repl;
 pub mod sandbox;
 pub mod secrets;
 pub mod session;
+#[cfg(feature = "gui")]
+pub mod shared_session;
+#[cfg(feature = "gui")]
+pub mod shell_dispatch;
 pub mod skills;
 pub mod subagent;
 pub mod team;

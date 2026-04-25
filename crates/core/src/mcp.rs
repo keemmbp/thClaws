@@ -163,9 +163,10 @@ async fn check_stdio_command_allowed(
                 allowlist.save();
                 Ok(())
             }
-            crate::permissions::ApprovalDecision::Deny => Err(Error::Provider(
-                format!("mcp spawn refused by user: `{}`", config.command),
-            )),
+            crate::permissions::ApprovalDecision::Deny => Err(Error::Provider(format!(
+                "mcp spawn refused by user: `{}`",
+                config.command
+            ))),
         };
     }
 

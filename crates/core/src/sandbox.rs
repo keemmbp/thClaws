@@ -88,8 +88,8 @@ impl Sandbox {
                 Ok(std::env::current_dir()?.join(p))
             };
         };
-        let cwd = std::env::current_dir()
-            .map_err(|e| Error::Tool(format!("cannot read cwd: {e}")))?;
+        let cwd =
+            std::env::current_dir().map_err(|e| Error::Tool(format!("cannot read cwd: {e}")))?;
         Self::validate_against(&root, &cwd, path)
     }
 
@@ -206,8 +206,7 @@ mod tests {
         with_sandbox(|root| {
             let file = root.join("abs.txt");
             std::fs::write(&file, "").unwrap();
-            let result =
-                Sandbox::validate_against(root, root, file.to_str().unwrap()).unwrap();
+            let result = Sandbox::validate_against(root, root, file.to_str().unwrap()).unwrap();
             assert!(result.starts_with(root));
         });
     }
@@ -263,8 +262,7 @@ mod tests {
             let sub = root.join("sub/dir");
             std::fs::create_dir_all(&sub).unwrap();
             std::fs::write(sub.join("deep.txt"), "").unwrap();
-            let result =
-                Sandbox::validate_against(root, root, "sub/dir/deep.txt").unwrap();
+            let result = Sandbox::validate_against(root, root, "sub/dir/deep.txt").unwrap();
             assert!(result.starts_with(root));
         });
     }
@@ -278,8 +276,7 @@ mod tests {
         with_sandbox(|root| {
             let worktree = root.join(".worktrees/backend");
             std::fs::create_dir_all(worktree.join("src")).unwrap();
-            let result =
-                Sandbox::validate_against(root, &worktree, "src/server.ts").unwrap();
+            let result = Sandbox::validate_against(root, &worktree, "src/server.ts").unwrap();
             assert!(
                 result.starts_with(&worktree),
                 "expected resolution under worktree, got {}",
@@ -315,12 +312,7 @@ mod tests {
     #[test]
     fn deep_new_path_allowed_when_intermediate_dirs_missing() {
         with_sandbox(|root| {
-            let result = Sandbox::validate_against(
-                root,
-                root,
-                "src/api/handlers/auth.ts",
-            )
-            .unwrap();
+            let result = Sandbox::validate_against(root, root, "src/api/handlers/auth.ts").unwrap();
             assert!(result.starts_with(root));
             assert!(result.ends_with("src/api/handlers/auth.ts"));
         });
@@ -333,12 +325,8 @@ mod tests {
         with_sandbox(|root| {
             let worktree = root.join(".worktrees/backend");
             std::fs::create_dir_all(&worktree).unwrap();
-            let result = Sandbox::validate_against(
-                root,
-                &worktree,
-                "src/api/handlers/auth.ts",
-            )
-            .unwrap();
+            let result =
+                Sandbox::validate_against(root, &worktree, "src/api/handlers/auth.ts").unwrap();
             assert!(result.starts_with(&worktree));
         });
     }

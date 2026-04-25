@@ -48,9 +48,8 @@ pub fn user_dotenv_path() -> Option<PathBuf> {
 /// Linux without Secret Service, or a user who declined the keychain
 /// permission prompt on macOS).
 pub fn upsert_user_env(var: &str, value: &str) -> crate::error::Result<PathBuf> {
-    let path = user_dotenv_path().ok_or_else(|| {
-        crate::error::Error::Config("cannot locate user home directory".into())
-    })?;
+    let path = user_dotenv_path()
+        .ok_or_else(|| crate::error::Error::Config("cannot locate user home directory".into()))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
