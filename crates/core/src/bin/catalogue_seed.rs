@@ -273,6 +273,58 @@ async fn run() -> Result<String, String> {
         report.push("  ollama-cloud: skipped (no OLLAMA_CLOUD_API_KEY)".into());
     }
 
+    // 5. Derive agent-sdk rows from anthropic. The Claude CLI subprocess
+    //    (ProviderKind::AgentSdk) accepts any claude-* model id; thClaws
+    //    routes it as `agent/<id>`. So for every claude-* row in the
+    //    anthropic catalogue, mirror an `agent/<id>` row into agent-sdk
+    //    with the same context. Skips ids already present so hand-curated
+    //    overrides win on metadata. Closes the lag pattern from
+    //    thclaws/thclaws#26 — Anthropic ships a new variant, native picks
+    //    it up via /v1/models, this step propagates it to agent-sdk.
+    let claude_ids: Vec<(String, Option<u32>)> = cat
+        .providers
+        .get("anthropic")
+        .map(|p| {
+            p.models
+                .iter()
+                .map(|(id, e)| (id.clone(), e.context))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !claude_ids.is_empty() {
+        let agent_pc = cat
+            .providers
+            .entry("agent-sdk".into())
+            .or_insert_with(ProviderCatalogue::default);
+        if agent_pc.default_context.is_none() {
+            agent_pc.default_context = Some(200000);
+        }
+        let mut stats = MergeStats::default();
+        for (claude_id, ctx) in claude_ids {
+            let agent_id = format!("agent/{claude_id}");
+            if agent_pc.models.contains_key(&agent_id) {
+                stats.unchanged += 1;
+                continue;
+            }
+            agent_pc.models.insert(
+                agent_id.clone(),
+                ModelEntry {
+                    context: ctx,
+                    max_output: None,
+                    source: Some(format!("derived:{claude_id}")),
+                    verified_at: Some(today.clone()),
+                },
+            );
+            stats.added.push(agent_id);
+        }
+        push_provider_stats(
+            &mut report,
+            "agent-sdk",
+            &stats,
+            Some("(derived from anthropic)"),
+        );
+    }
+
     cat.source = format!("baseline {today}");
     cat.fetched_at = format!("{today}T00:00:00Z");
 
